@@ -16,11 +16,14 @@ def get_eth_balance(address, api_key):
     try:
         response = requests.get(url)
         response.raise_for_status()
-        balance_wei = int(response.json()['result'])
+        balance_wei = int(response.json().get('result', 0))
         balance_eth = balance_wei / 10**18
         return balance_eth
     except requests.exceptions.RequestException as e:
         logging.error(f'Error fetching ETH balance: {e}')
+        return None
+    except ValueError as e:
+        logging.error(f'Error parsing ETH balance: {e}')
         return None
 
 def get_last_transactions(address, api_key, count=10):
@@ -29,10 +32,13 @@ def get_last_transactions(address, api_key, count=10):
     try:
         response = requests.get(url)
         response.raise_for_status()
-        transactions = response.json()['result'][:count]
+        transactions = response.json().get('result', [])[:count]
         return transactions
     except requests.exceptions.RequestException as e:
         logging.error(f'Error fetching transactions: {e}')
+        return []
+    except ValueError as e:
+        logging.error(f'Error parsing transactions: {e}')
         return []
 
 def get_eth_price(api_key):
@@ -41,10 +47,13 @@ def get_eth_price(api_key):
     try:
         response = requests.get(url)
         response.raise_for_status()
-        eth_price_usd = float(response.json()['result']['ethusd'])
+        eth_price_usd = float(response.json().get('result', {}).get('ethusd', 0))
         return eth_price_usd
     except requests.exceptions.RequestException as e:
         logging.error(f'Error fetching ETH price: {e}')
+        return None
+    except ValueError as e:
+        logging.error(f'Error parsing ETH price: {e}')
         return None
 
 def calculate_transaction_totals(transactions, address):
@@ -52,11 +61,14 @@ def calculate_transaction_totals(transactions, address):
     total_incoming = 0
     total_outgoing = 0
     for tx in transactions:
-        value_eth = int(tx['value']) / 10**18
-        if tx['to'].lower() == address.lower():
-            total_incoming += value_eth
-        else:
-            total_outgoing += value_eth
+        try:
+            value_eth = int(tx['value']) / 10**18
+            if tx['to'].lower() == address.lower():
+                total_incoming += value_eth
+            else:
+                total_outgoing += value_eth
+        except KeyError as e:
+            logging.error(f'Missing expected transaction key: {e}')
     return total_incoming, total_outgoing
 
 def save_transactions_to_csv(transactions, filename='transactions.csv'):
