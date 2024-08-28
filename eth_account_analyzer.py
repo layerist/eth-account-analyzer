@@ -3,66 +3,74 @@ import csv
 import logging
 import argparse
 from datetime import datetime
+from typing import List, Tuple, Optional
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Base URL for API requests
 BASE_URL = 'https://api.etherscan.io/api'
+WEI_TO_ETH = 10**18
 
-def get_eth_balance(address, api_key):
+def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     """Get the ETH balance of the specified address."""
     url = f'{BASE_URL}?module=account&action=balance&address={address}&tag=latest&apikey={api_key}'
     try:
         response = requests.get(url)
         response.raise_for_status()
-        balance_wei = int(response.json().get('result', 0))
-        balance_eth = balance_wei / 10**18
-        return balance_eth
+        result = response.json().get('result')
+        if result is None:
+            logging.error('No result found in response when fetching ETH balance.')
+            return None
+        balance_wei = int(result)
+        return balance_wei / WEI_TO_ETH
     except requests.exceptions.RequestException as e:
         logging.error(f'Error fetching ETH balance: {e}')
-        return None
     except ValueError as e:
         logging.error(f'Error parsing ETH balance: {e}')
-        return None
+    return None
 
-def get_last_transactions(address, api_key, count=10):
+def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[dict]:
     """Get the last transactions of the specified address."""
     url = f'{BASE_URL}?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&sort=desc&apikey={api_key}'
     try:
         response = requests.get(url)
         response.raise_for_status()
-        transactions = response.json().get('result', [])[:count]
-        return transactions
+        result = response.json().get('result')
+        if not isinstance(result, list):
+            logging.error('Unexpected result format when fetching transactions.')
+            return []
+        return result[:count]
     except requests.exceptions.RequestException as e:
         logging.error(f'Error fetching transactions: {e}')
-        return []
     except ValueError as e:
         logging.error(f'Error parsing transactions: {e}')
-        return []
+    return []
 
-def get_eth_price(api_key):
+def get_eth_price(api_key: str) -> Optional[float]:
     """Get the current ETH price in USD."""
     url = f'{BASE_URL}?module=stats&action=ethprice&apikey={api_key}'
     try:
         response = requests.get(url)
         response.raise_for_status()
-        eth_price_usd = float(response.json().get('result', {}).get('ethusd', 0))
-        return eth_price_usd
+        result = response.json().get('result')
+        if not result or 'ethusd' not in result:
+            logging.error('Unexpected result format when fetching ETH price.')
+            return None
+        return float(result.get('ethusd', 0))
     except requests.exceptions.RequestException as e:
         logging.error(f'Error fetching ETH price: {e}')
-        return None
     except ValueError as e:
         logging.error(f'Error parsing ETH price: {e}')
-        return None
+    return None
 
-def calculate_transaction_totals(transactions, address):
+def calculate_transaction_totals(transactions: List[dict], address: str) -> Tuple[float, float]:
     """Calculate the total sum of incoming and outgoing transactions."""
-    total_incoming = 0
-    total_outgoing = 0
+    total_incoming = 0.0
+    total_outgoing = 0.0
     for tx in transactions:
         try:
-            value_eth = int(tx['value']) / 10**18
+            value_eth = int(tx['value']) / WEI_TO_ETH
             if tx['to'].lower() == address.lower():
                 total_incoming += value_eth
             else:
@@ -71,7 +79,7 @@ def calculate_transaction_totals(transactions, address):
             logging.error(f'Missing expected transaction key: {e}')
     return total_incoming, total_outgoing
 
-def save_transactions_to_csv(transactions, filename='transactions.csv'):
+def save_transactions_to_csv(transactions: List[dict], filename: str = 'transactions.csv') -> None:
     """Save transaction information to a CSV file."""
     try:
         with open(filename, mode='w', newline='') as file:
@@ -84,7 +92,7 @@ def save_transactions_to_csv(transactions, filename='transactions.csv'):
                     datetime.fromtimestamp(int(tx['timeStamp'])),
                     tx['from'],
                     tx['to'],
-                    int(tx['value']) / 10**18,
+                    int(tx['value']) / WEI_TO_ETH,
                     tx['gas'],
                     tx['gasPrice'],
                     tx['input']
@@ -110,7 +118,7 @@ def main():
     # Get last 10 transactions
     transactions = get_last_transactions(address, api_key)
     if transactions:
-        logging.info(f'Last 10 Transactions: {transactions}')
+        logging.info(f'Fetched {len(transactions)} transactions.')
 
     # Get current ETH price in USD
     eth_price = get_eth_price(api_key)
