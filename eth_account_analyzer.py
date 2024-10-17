@@ -37,10 +37,7 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     }
     data = make_request('balance', params)
     if data:
-        try:
-            return int(data['result']) / WEI_TO_ETH
-        except (KeyError, ValueError):
-            logging.error("Error processing balance data.")
+        return int(data.get('result', 0)) / WEI_TO_ETH
     return None
 
 def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[dict]:
@@ -55,9 +52,7 @@ def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[d
         'apikey': api_key
     }
     data = make_request('txlist', params)
-    if data:
-        return data.get('result', [])[:count]
-    return []
+    return data.get('result', [])[:count] if data else []
 
 def get_eth_price(api_key: str) -> Optional[float]:
     """Fetches the current price of ETH in USD."""
@@ -68,23 +63,20 @@ def get_eth_price(api_key: str) -> Optional[float]:
     }
     data = make_request('ethprice', params)
     if data:
-        try:
-            return float(data['result']['ethusd'])
-        except (KeyError, ValueError):
-            logging.error("Error processing ETH price data.")
+        return float(data['result'].get('ethusd', 0.0))
     return None
 
 def calculate_transaction_totals(transactions: List[dict], address: str) -> Tuple[float, float]:
     """Calculates total incoming and outgoing ETH based on transactions."""
     total_incoming, total_outgoing = 0.0, 0.0
     address_lower = address.lower()
-    
+
     for tx in transactions:
         try:
             value_eth = int(tx['value']) / WEI_TO_ETH
             if tx['to'].lower() == address_lower:
                 total_incoming += value_eth
-            else:
+            elif tx['from'].lower() == address_lower:
                 total_outgoing += value_eth
         except (KeyError, ValueError) as e:
             logging.error(f"Error processing transaction data: {e}")
@@ -100,7 +92,7 @@ def save_transactions_to_csv(transactions: List[dict], filename: str) -> None:
                 writer.writerow([
                     tx['hash'],
                     tx['blockNumber'],
-                    datetime.fromtimestamp(int(tx['timeStamp'])),
+                    datetime.utcfromtimestamp(int(tx['timeStamp'])),
                     tx['from'],
                     tx['to'],
                     int(tx['value']) / WEI_TO_ETH,
@@ -129,23 +121,30 @@ def main():
     balance = get_eth_balance(address, api_key)
     if balance is not None:
         logging.info(f'ETH Balance: {balance:.4f} ETH')
+    else:
+        logging.warning(f"Failed to fetch balance for address: {address}")
 
     # Fetch recent transactions
     transactions = get_last_transactions(address, api_key, count)
     if transactions:
         logging.info(f'Fetched {len(transactions)} transactions.')
+    else:
+        logging.warning(f"No transactions found for address: {address}")
 
     # Fetch ETH price
     eth_price = get_eth_price(api_key)
     if eth_price is not None:
         logging.info(f'Current ETH Price: ${eth_price:.2f} USD')
+    else:
+        logging.warning(f"Failed to fetch ETH price.")
 
     # Calculate total incoming/outgoing ETH
-    total_incoming, total_outgoing = calculate_transaction_totals(transactions, address)
-    logging.info(f'Total Incoming: {total_incoming:.4f} ETH, Total Outgoing: {total_outgoing:.4f} ETH')
+    if transactions:
+        total_incoming, total_outgoing = calculate_transaction_totals(transactions, address)
+        logging.info(f'Total Incoming: {total_incoming:.4f} ETH, Total Outgoing: {total_outgoing:.4f} ETH')
 
-    # Save transactions to CSV
-    save_transactions_to_csv(transactions, csv_filename)
+        # Save transactions to CSV
+        save_transactions_to_csv(transactions, csv_filename)
 
 if __name__ == '__main__':
     main()
