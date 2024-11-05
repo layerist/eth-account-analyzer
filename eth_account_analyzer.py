@@ -3,16 +3,16 @@ import csv
 import logging
 import argparse
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
-# Set up logging
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Constants
 BASE_URL = 'https://api.etherscan.io/api'
 WEI_TO_ETH = 10**18
 
-def make_request(endpoint: str, params: dict) -> Optional[dict]:
+def make_request(endpoint: str, params: Dict[str, str]) -> Optional[dict]:
     """Handles HTTP requests and error handling for the Etherscan API."""
     try:
         response = requests.get(BASE_URL, params=params)
@@ -22,7 +22,7 @@ def make_request(endpoint: str, params: dict) -> Optional[dict]:
             logging.error(f"API Error: {data.get('message')}")
             return None
         return data
-    except (requests.RequestException, ValueError) as e:
+    except requests.RequestException as e:
         logging.error(f"Request failed: {e}")
         return None
 
@@ -46,8 +46,8 @@ def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[d
         'module': 'account',
         'action': 'txlist',
         'address': address,
-        'startblock': 0,
-        'endblock': 99999999,
+        'startblock': '0',
+        'endblock': '99999999',
         'sort': 'desc',
         'apikey': api_key
     }
@@ -63,7 +63,10 @@ def get_eth_price(api_key: str) -> Optional[float]:
     }
     data = make_request('ethprice', params)
     if data:
-        return float(data['result'].get('ethusd', 0.0))
+        try:
+            return float(data['result'].get('ethusd', 0.0))
+        except ValueError as e:
+            logging.error(f"Error parsing ETH price: {e}")
     return None
 
 def calculate_transaction_totals(transactions: List[dict], address: str) -> Tuple[float, float]:
@@ -112,39 +115,34 @@ def main():
     parser.add_argument('--csv', type=str, default='transactions.csv', help='Filename to save transactions')
     args = parser.parse_args()
 
-    address = args.address
-    api_key = args.apikey
-    count = args.count
-    csv_filename = args.csv
-
     # Fetch ETH balance
-    balance = get_eth_balance(address, api_key)
+    balance = get_eth_balance(args.address, args.apikey)
     if balance is not None:
         logging.info(f'ETH Balance: {balance:.4f} ETH')
     else:
-        logging.warning(f"Failed to fetch balance for address: {address}")
+        logging.warning(f"Failed to fetch balance for address: {args.address}")
 
     # Fetch recent transactions
-    transactions = get_last_transactions(address, api_key, count)
+    transactions = get_last_transactions(args.address, args.apikey, args.count)
     if transactions:
         logging.info(f'Fetched {len(transactions)} transactions.')
     else:
-        logging.warning(f"No transactions found for address: {address}")
+        logging.warning(f"No transactions found for address: {args.address}")
 
     # Fetch ETH price
-    eth_price = get_eth_price(api_key)
+    eth_price = get_eth_price(args.apikey)
     if eth_price is not None:
         logging.info(f'Current ETH Price: ${eth_price:.2f} USD')
     else:
-        logging.warning(f"Failed to fetch ETH price.")
+        logging.warning("Failed to fetch ETH price.")
 
     # Calculate total incoming/outgoing ETH
     if transactions:
-        total_incoming, total_outgoing = calculate_transaction_totals(transactions, address)
+        total_incoming, total_outgoing = calculate_transaction_totals(transactions, args.address)
         logging.info(f'Total Incoming: {total_incoming:.4f} ETH, Total Outgoing: {total_outgoing:.4f} ETH')
 
         # Save transactions to CSV
-        save_transactions_to_csv(transactions, csv_filename)
+        save_transactions_to_csv(transactions, args.csv)
 
 if __name__ == '__main__':
     main()
