@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 BASE_URL = 'https://api.etherscan.io/api'
 WEI_TO_ETH = 10**18
 
-def make_request(endpoint: str, params: Dict[str, str]) -> Optional[dict]:
+def make_request(params: Dict[str, str]) -> Optional[dict]:
     """Handles HTTP requests and error handling for the Etherscan API."""
     try:
         response = requests.get(BASE_URL, params=params)
@@ -24,7 +24,7 @@ def make_request(endpoint: str, params: Dict[str, str]) -> Optional[dict]:
         return data
     except requests.RequestException as e:
         logging.error(f"Request failed: {e}")
-        return None
+    return None
 
 def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     """Fetches the ETH balance of the specified address."""
@@ -35,13 +35,16 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
         'tag': 'latest',
         'apikey': api_key
     }
-    data = make_request('balance', params)
+    data = make_request(params)
     if data:
-        return int(data.get('result', 0)) / WEI_TO_ETH
+        try:
+            return int(data.get('result', 0)) / WEI_TO_ETH
+        except (ValueError, KeyError) as e:
+            logging.error(f"Error parsing balance data: {e}")
     return None
 
 def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[dict]:
-    """Fetches the latest transactions of the specified address, limited by count."""
+    """Fetches the latest transactions of the specified address."""
     params = {
         'module': 'account',
         'action': 'txlist',
@@ -51,17 +54,17 @@ def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[d
         'sort': 'desc',
         'apikey': api_key
     }
-    data = make_request('txlist', params)
+    data = make_request(params)
     return data.get('result', [])[:count] if data else []
 
 def get_eth_price(api_key: str) -> Optional[float]:
-    """Fetches the current price of ETH in USD."""
+    """Fetches the current ETH price in USD."""
     params = {
         'module': 'stats',
         'action': 'ethprice',
         'apikey': api_key
     }
-    data = make_request('ethprice', params)
+    data = make_request(params)
     if data:
         try:
             return float(data['result'].get('ethusd', 0.0))
@@ -88,24 +91,24 @@ def calculate_transaction_totals(transactions: List[dict], address: str) -> Tupl
 def save_transactions_to_csv(transactions: List[dict], filename: str) -> None:
     """Saves transaction details to a CSV file."""
     try:
-        with open(filename, mode='w', newline='') as file:
+        with open(filename, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(['TxHash', 'BlockNumber', 'TimeStamp', 'From', 'To', 'Value (ETH)', 'Gas', 'GasPrice', 'Input'])
             for tx in transactions:
                 writer.writerow([
-                    tx['hash'],
-                    tx['blockNumber'],
-                    datetime.utcfromtimestamp(int(tx['timeStamp'])),
-                    tx['from'],
-                    tx['to'],
-                    int(tx['value']) / WEI_TO_ETH,
-                    tx['gas'],
-                    tx['gasPrice'],
-                    tx['input']
+                    tx.get('hash'),
+                    tx.get('blockNumber'),
+                    datetime.utcfromtimestamp(int(tx.get('timeStamp'))),
+                    tx.get('from'),
+                    tx.get('to'),
+                    int(tx.get('value', 0)) / WEI_TO_ETH,
+                    tx.get('gas'),
+                    tx.get('gasPrice'),
+                    tx.get('input')
                 ])
         logging.info(f'Transactions successfully saved to {filename}')
     except IOError as e:
-        logging.error(f'Error saving transactions to CSV: {e}')
+        logging.error(f"Error saving transactions to CSV: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='Fetch and analyze Ethereum transactions.')
