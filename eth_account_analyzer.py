@@ -12,12 +12,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 class Config:
     BASE_URL = "https://api.etherscan.io/api"
     WEI_TO_ETH = 10 ** 18
+    DEFAULT_CSV_FILENAME = "transactions.csv"
+    DEFAULT_TRANSACTION_COUNT = 10
+    TIMEOUT = 10  # seconds
 
 
 def make_request(params: Dict[str, str]) -> Optional[dict]:
     """Send a request to the Etherscan API and handle errors."""
     try:
-        response = requests.get(Config.BASE_URL, params=params, timeout=10)
+        response = requests.get(Config.BASE_URL, params=params, timeout=Config.TIMEOUT)
         response.raise_for_status()
         data = response.json()
         if data.get("status") != "1":
@@ -47,7 +50,7 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     return None
 
 
-def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[dict]:
+def get_last_transactions(address: str, api_key: str, count: int = Config.DEFAULT_TRANSACTION_COUNT) -> List[dict]:
     """Retrieve the most recent transactions for the specified address."""
     params = {
         "module": "account",
@@ -61,7 +64,8 @@ def get_last_transactions(address: str, api_key: str, count: int = 10) -> List[d
     data = make_request(params)
     if data:
         try:
-            return data.get("result", [])[:count]
+            transactions = data.get("result", [])
+            return transactions[:count] if count > 0 else transactions
         except KeyError:
             logging.error("Error accessing transaction data.")
     return []
@@ -98,6 +102,10 @@ def calculate_transaction_totals(transactions: List[dict], address: str) -> Tupl
 
 def save_transactions_to_csv(transactions: List[dict], filename: str) -> None:
     """Save Ethereum transactions to a CSV file."""
+    if not transactions:
+        logging.warning("No transactions to save.")
+        return
+
     try:
         with open(filename, mode="w", newline="", encoding="utf-8") as file:
             fieldnames = [
@@ -126,8 +134,18 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch and analyze Ethereum transactions.")
     parser.add_argument("address", type=str, help="Ethereum address")
     parser.add_argument("apikey", type=str, help="Etherscan API key")
-    parser.add_argument("--count", type=int, default=10, help="Number of transactions to fetch (default: 10)")
-    parser.add_argument("--csv", type=str, default="transactions.csv", help="Output CSV file (default: transactions.csv)")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=Config.DEFAULT_TRANSACTION_COUNT,
+        help=f"Number of transactions to fetch (default: {Config.DEFAULT_TRANSACTION_COUNT})",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=Config.DEFAULT_CSV_FILENAME,
+        help=f"Output CSV file (default: {Config.DEFAULT_CSV_FILENAME})",
+    )
     args = parser.parse_args()
 
     # Fetch Ethereum balance
