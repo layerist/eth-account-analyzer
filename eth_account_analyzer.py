@@ -4,20 +4,22 @@ import logging
 import argparse
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+@dataclass
 class Config:
-    BASE_URL = "https://api.etherscan.io/api"
-    WEI_TO_ETH = 10 ** 18
-    DEFAULT_CSV_FILENAME = "transactions.csv"
-    DEFAULT_TRANSACTION_COUNT = 10
-    TIMEOUT = 10  # seconds
+    BASE_URL: str = "https://api.etherscan.io/api"
+    WEI_TO_ETH: int = 10 ** 18
+    DEFAULT_CSV_FILENAME: str = "transactions.csv"
+    DEFAULT_TRANSACTION_COUNT: int = 10
+    TIMEOUT: int = 10  # seconds
 
 
-def make_request(params: Dict[str, str]) -> Optional[dict]:
+def make_request(params: Dict[str, str]) -> Optional[Dict]:
     """Send a request to the Etherscan API and handle errors."""
     try:
         response = requests.get(Config.BASE_URL, params=params, timeout=Config.TIMEOUT)
@@ -45,7 +47,7 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     return int(data["result"]) / Config.WEI_TO_ETH if data else None
 
 
-def get_last_transactions(address: str, api_key: str, count: int = Config.DEFAULT_TRANSACTION_COUNT) -> List[dict]:
+def get_last_transactions(address: str, api_key: str, count: int = Config.DEFAULT_TRANSACTION_COUNT) -> List[Dict]:
     """Retrieve the most recent transactions for the specified address."""
     params = {
         "module": "account",
@@ -67,25 +69,21 @@ def get_eth_price(api_key: str) -> Optional[float]:
     return float(data["result"]["ethusd"]) if data else None
 
 
-def calculate_transaction_totals(transactions: List[dict], address: str) -> Tuple[float, float]:
+def calculate_transaction_totals(transactions: List[Dict], address: str) -> Tuple[float, float]:
     """Calculate total incoming and outgoing Ethereum for a given address."""
-    total_incoming, total_outgoing = 0.0, 0.0
     address_lower = address.lower()
-    
-    for tx in transactions:
-        try:
-            value_eth = int(tx["value"]) / Config.WEI_TO_ETH
-            if tx.get("to", "").lower() == address_lower:
-                total_incoming += value_eth
-            elif tx.get("from", "").lower() == address_lower:
-                total_outgoing += value_eth
-        except (KeyError, ValueError) as e:
-            logging.error(f"Error processing transaction data: {e}")
-    
+
+    total_incoming = sum(
+        int(tx["value"]) / Config.WEI_TO_ETH for tx in transactions if tx.get("to", "").lower() == address_lower
+    )
+    total_outgoing = sum(
+        int(tx["value"]) / Config.WEI_TO_ETH for tx in transactions if tx.get("from", "").lower() == address_lower
+    )
+
     return total_incoming, total_outgoing
 
 
-def save_transactions_to_csv(transactions: List[dict], filename: str) -> None:
+def save_transactions_to_csv(transactions: List[Dict], filename: str) -> None:
     """Save Ethereum transactions to a CSV file."""
     if not transactions:
         logging.warning("No transactions to save.")
@@ -96,12 +94,12 @@ def save_transactions_to_csv(transactions: List[dict], filename: str) -> None:
             fieldnames = ["hash", "blockNumber", "timeStamp", "from", "to", "value", "gas", "gasPrice", "input"]
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for tx in transactions:
                 tx["value"] = int(tx.get("value", 0)) / Config.WEI_TO_ETH
                 tx["timeStamp"] = datetime.utcfromtimestamp(int(tx["timeStamp"])).isoformat()
                 writer.writerow(tx)
-                
+
         logging.info(f"Transactions saved to {filename}")
     except IOError as e:
         logging.error(f"Error writing CSV file: {e}")
