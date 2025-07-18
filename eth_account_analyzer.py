@@ -1,50 +1,63 @@
 import argparse
 import csv
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-# Configure logging
+
+# Configuration and constants
+@dataclass(frozen=True)
+class Config:
+    BASE_URL: str = "https://api.etherscan.io/api"
+    WEI_TO_ETH: int = 10 ** 18
+    DEFAULT_CSV_FILENAME: str = "transactions.csv"
+    DEFAULT_TRANSACTION_COUNT: int = 10
+    TIMEOUT: int = 10
+    RETRIES: int = 3
+
+
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Constants and config
-@dataclass(frozen=True)
-class Config:
-    BASE_URL: str = "https://api.etherscan.io/api"
-    WEI_TO_ETH: int = 10**18
-    DEFAULT_CSV_FILENAME: str = "transactions.csv"
-    DEFAULT_TRANSACTION_COUNT: int = 10
-    TIMEOUT: int = 10  # seconds
-    RETRIES: int = 3
 
-# Create a session with retry logic
-session = requests.Session()
-retries = Retry(total=Config.RETRIES, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
+def get_session() -> requests.Session:
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=Config.RETRIES,
+        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=1
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    return session
 
-def make_request(params: Dict[str, str]) -> Optional[Dict]:
-    """Make a GET request to the Etherscan API with retries."""
+
+session = get_session()
+
+
+def make_request(params: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
         response = session.get(Config.BASE_URL, params=params, timeout=Config.TIMEOUT)
         response.raise_for_status()
         data = response.json()
         if data.get("status") != "1" or "result" not in data:
-            logging.error(f"Etherscan API error: {data.get('message', 'Unknown error')} | Params: {params}")
+            logging.error(f"API error: {data.get('message', 'Unknown')} | Params: {params}")
             return None
         return data
     except requests.RequestException as e:
-        logging.error(f"Request failed: {e} | Params: {params}")
+        logging.error(f"HTTP request failed: {e} | Params: {params}")
         return None
 
+
 def get_eth_balance(address: str, api_key: str) -> Optional[float]:
-    """Get the ETH balance of a given address."""
     params = {
         "module": "account",
         "action": "balance",
@@ -53,30 +66,28 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
         "apikey": api_key
     }
     data = make_request(params)
-    if data:
-        try:
-            return int(data["result"]) / Config.WEI_TO_ETH
-        except (ValueError, KeyError):
-            logging.exception("Failed to parse ETH balance.")
-    return None
+    try:
+        return int(data["result"]) / Config.WEI_TO_ETH if data else None
+    except (ValueError, KeyError):
+        logging.exception("Failed to parse ETH balance.")
+        return None
+
 
 def get_eth_price(api_key: str) -> Optional[float]:
-    """Get the current ETH price in USD."""
     params = {
         "module": "stats",
         "action": "ethprice",
         "apikey": api_key
     }
     data = make_request(params)
-    if data:
-        try:
-            return float(data["result"]["ethusd"])
-        except (ValueError, KeyError, TypeError):
-            logging.exception("Failed to parse ETH price.")
-    return None
+    try:
+        return float(data["result"]["ethusd"]) if data else None
+    except (ValueError, KeyError, TypeError):
+        logging.exception("Failed to parse ETH price.")
+        return None
 
-def get_last_transactions(address: str, api_key: str, count: int) -> List[Dict]:
-    """Fetch the most recent transactions for an address."""
+
+def get_last_transactions(address: str, api_key: str, count: int) -> List[Dict[str, Any]]:
     params = {
         "module": "account",
         "action": "txlist",
@@ -87,39 +98,36 @@ def get_last_transactions(address: str, api_key: str, count: int) -> List[Dict]:
         "apikey": api_key
     }
     data = make_request(params)
-    if data:
-        return data.get("result", [])[:count]
-    return []
+    return data.get("result", [])[:count] if data else []
 
-def calculate_transaction_totals(transactions: List[Dict], address: str) -> Tuple[float, float]:
-    """Calculate total ETH sent and received by the address."""
+
+def calculate_transaction_totals(transactions: List[Dict[str, Any]], address: str) -> Tuple[float, float]:
     total_in = total_out = 0.0
     address = address.lower()
 
     for tx in transactions:
         try:
-            value = int(tx.get("value", 0)) / Config.WEI_TO_ETH
-            if tx.get("to", "").lower() == address:
-                total_in += value
-            elif tx.get("from", "").lower() == address:
-                total_out += value
+            value_eth = int(tx.get("value", 0)) / Config.WEI_TO_ETH
+            from_addr = tx.get("from", "").lower()
+            to_addr = tx.get("to", "").lower()
+            if to_addr == address:
+                total_in += value_eth
+            elif from_addr == address:
+                total_out += value_eth
         except (ValueError, TypeError):
-            logging.warning(f"Skipping transaction due to invalid value: {tx}")
-            continue
-
+            logging.warning(f"Skipping malformed transaction: {tx}")
     return total_in, total_out
 
-def save_transactions_to_csv(transactions: List[Dict], filename: str) -> None:
-    """Save transactions to a CSV file sorted by timestamp (descending)."""
+
+def save_transactions_to_csv(transactions: List[Dict[str, Any]], filename: str, eth_price: Optional[float]) -> None:
     if not transactions:
-        logging.warning("No transactions to save.")
+        logging.warning("No transactions to write.")
         return
 
-    fieldnames = ["hash", "blockNumber", "timeStamp", "from", "to", "value", "gas", "gasPrice"]
+    fieldnames = ["hash", "blockNumber", "timeStamp", "from", "to", "value (ETH)", "value (USD)", "gas", "gasPrice"]
 
     try:
-        # Sort by timeStamp descending
-        transactions.sort(key=lambda x: int(x.get("timeStamp", 0)), reverse=True)
+        transactions.sort(key=lambda tx: int(tx.get("timeStamp", 0)), reverse=True)
 
         with open(filename, mode="w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -127,58 +135,63 @@ def save_transactions_to_csv(transactions: List[Dict], filename: str) -> None:
 
             for tx in transactions:
                 try:
+                    value_eth = int(tx.get("value", 0)) / Config.WEI_TO_ETH
                     writer.writerow({
                         "hash": tx.get("hash", ""),
                         "blockNumber": tx.get("blockNumber", ""),
                         "timeStamp": datetime.utcfromtimestamp(int(tx.get("timeStamp", 0))).isoformat(),
                         "from": tx.get("from", ""),
                         "to": tx.get("to", ""),
-                        "value": round(int(tx.get("value", 0)) / Config.WEI_TO_ETH, 8),
+                        "value (ETH)": round(value_eth, 6),
+                        "value (USD)": round(value_eth * eth_price, 2) if eth_price else "",
                         "gas": tx.get("gas", ""),
                         "gasPrice": tx.get("gasPrice", "")
                     })
                 except Exception as e:
-                    logging.warning(f"Skipping invalid transaction row: {e}")
+                    logging.warning(f"Failed to write transaction: {e}")
 
-        logging.info(f"{len(transactions)} transactions saved to '{filename}'")
+        logging.info(f"Saved {len(transactions)} transactions to '{filename}'")
 
     except IOError as e:
-        logging.error(f"Failed to write CSV file '{filename}': {e}")
+        logging.error(f"Error writing to file '{filename}': {e}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Query Ethereum address balance, fetch recent transactions, and save to CSV."
+        description="Fetch ETH balance and recent transactions for an address."
     )
-    parser.add_argument("address", help="Ethereum address to query")
-    parser.add_argument("apikey", help="Your Etherscan API key")
+    parser.add_argument("address", help="Ethereum address")
+    parser.add_argument("apikey", help="Etherscan API key (or set ETHERSCAN_API_KEY env variable)")
     parser.add_argument("--count", type=int, default=Config.DEFAULT_TRANSACTION_COUNT,
-                        help=f"Number of recent transactions to fetch (default: {Config.DEFAULT_TRANSACTION_COUNT})")
+                        help=f"Number of transactions to fetch (default: {Config.DEFAULT_TRANSACTION_COUNT})")
     parser.add_argument("--csv", default=Config.DEFAULT_CSV_FILENAME,
-                        help=f"CSV filename to save transactions (default: '{Config.DEFAULT_CSV_FILENAME}')")
+                        help=f"CSV output filename (default: {Config.DEFAULT_CSV_FILENAME})")
 
     args = parser.parse_args()
+    api_key = args.apikey or os.getenv("ETHERSCAN_API_KEY")
 
-    logging.info(f"Querying Ethereum address: {args.address}")
+    logging.info(f"Analyzing address: {args.address}")
 
-    balance = get_eth_balance(args.address, args.apikey)
+    balance = get_eth_balance(args.address, api_key)
     if balance is not None:
-        logging.info(f"ETH Balance: {balance:.4f} ETH")
+        logging.info(f"Balance: {balance:.6f} ETH")
     else:
-        logging.error("Could not retrieve ETH balance.")
+        logging.error("Failed to retrieve ETH balance.")
 
-    price = get_eth_price(args.apikey)
-    if price is not None:
-        logging.info(f"Current ETH Price: ${price:.2f}")
+    eth_price = get_eth_price(api_key)
+    if eth_price is not None:
+        logging.info(f"Current ETH Price: ${eth_price:.2f}")
     else:
-        logging.error("Could not retrieve ETH price.")
+        logging.warning("ETH price unavailable.")
 
-    transactions = get_last_transactions(args.address, args.apikey, args.count)
+    transactions = get_last_transactions(args.address, api_key, args.count)
     logging.info(f"Fetched {len(transactions)} transactions.")
 
     if transactions:
         total_in, total_out = calculate_transaction_totals(transactions, args.address)
-        logging.info(f"Total Received: {total_in:.4f} ETH | Total Sent: {total_out:.4f} ETH")
-        save_transactions_to_csv(transactions, args.csv)
+        logging.info(f"Total Received: {total_in:.6f} ETH | Total Sent: {total_out:.6f} ETH")
+        save_transactions_to_csv(transactions, args.csv, eth_price)
+
 
 if __name__ == "__main__":
     main()
