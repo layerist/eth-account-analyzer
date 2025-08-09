@@ -10,9 +10,9 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 
-# Configuration and constants
 @dataclass(frozen=True)
 class Config:
+    """Application configuration constants."""
     BASE_URL: str = "https://api.etherscan.io/api"
     WEI_TO_ETH: int = 10 ** 18
     DEFAULT_CSV_FILENAME: str = "transactions.csv"
@@ -29,10 +29,12 @@ logging.basicConfig(
 
 
 def get_session() -> requests.Session:
+    """Create and configure a requests Session with retry logic."""
     session = requests.Session()
     retry_strategy = Retry(
         total=Config.RETRIES,
         status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
         backoff_factor=1
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -44,20 +46,23 @@ session = get_session()
 
 
 def make_request(params: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Make an HTTP GET request to the Etherscan API."""
     try:
         response = session.get(Config.BASE_URL, params=params, timeout=Config.TIMEOUT)
         response.raise_for_status()
         data = response.json()
+
         if data.get("status") != "1" or "result" not in data:
             logging.error(f"API error: {data.get('message', 'Unknown')} | Params: {params}")
             return None
         return data
-    except requests.RequestException as e:
-        logging.error(f"HTTP request failed: {e} | Params: {params}")
+    except (requests.RequestException, ValueError) as e:
+        logging.error(f"Request failed: {e} | Params: {params}")
         return None
 
 
 def get_eth_balance(address: str, api_key: str) -> Optional[float]:
+    """Retrieve ETH balance for a given address."""
     params = {
         "module": "account",
         "action": "balance",
@@ -68,12 +73,13 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     data = make_request(params)
     try:
         return int(data["result"]) / Config.WEI_TO_ETH if data else None
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, TypeError):
         logging.exception("Failed to parse ETH balance.")
         return None
 
 
 def get_eth_price(api_key: str) -> Optional[float]:
+    """Retrieve current ETH price in USD."""
     params = {
         "module": "stats",
         "action": "ethprice",
@@ -88,6 +94,7 @@ def get_eth_price(api_key: str) -> Optional[float]:
 
 
 def get_last_transactions(address: str, api_key: str, count: int) -> List[Dict[str, Any]]:
+    """Retrieve recent transactions for a given Ethereum address."""
     params = {
         "module": "account",
         "action": "txlist",
@@ -102,7 +109,8 @@ def get_last_transactions(address: str, api_key: str, count: int) -> List[Dict[s
 
 
 def calculate_transaction_totals(transactions: List[Dict[str, Any]], address: str) -> Tuple[float, float]:
-    total_in = total_out = 0.0
+    """Calculate total ETH received and sent by the address."""
+    total_in, total_out = 0.0, 0.0
     address = address.lower()
 
     for tx in transactions:
@@ -110,21 +118,25 @@ def calculate_transaction_totals(transactions: List[Dict[str, Any]], address: st
             value_eth = int(tx.get("value", 0)) / Config.WEI_TO_ETH
             from_addr = tx.get("from", "").lower()
             to_addr = tx.get("to", "").lower()
+
             if to_addr == address:
                 total_in += value_eth
             elif from_addr == address:
                 total_out += value_eth
         except (ValueError, TypeError):
             logging.warning(f"Skipping malformed transaction: {tx}")
+
     return total_in, total_out
 
 
 def save_transactions_to_csv(transactions: List[Dict[str, Any]], filename: str, eth_price: Optional[float]) -> None:
+    """Save transactions to a CSV file."""
     if not transactions:
         logging.warning("No transactions to write.")
         return
 
-    fieldnames = ["hash", "blockNumber", "timeStamp", "from", "to", "value (ETH)", "value (USD)", "gas", "gasPrice"]
+    fieldnames = ["hash", "blockNumber", "timeStamp", "from", "to",
+                  "value (ETH)", "value (USD)", "gas", "gasPrice"]
 
     try:
         transactions.sort(key=lambda tx: int(tx.get("timeStamp", 0)), reverse=True)
@@ -147,11 +159,10 @@ def save_transactions_to_csv(transactions: List[Dict[str, Any]], filename: str, 
                         "gas": tx.get("gas", ""),
                         "gasPrice": tx.get("gasPrice", "")
                     })
-                except Exception as e:
-                    logging.warning(f"Failed to write transaction: {e}")
+                except (ValueError, KeyError, TypeError) as e:
+                    logging.warning(f"Skipping invalid transaction row: {e}")
 
         logging.info(f"Saved {len(transactions)} transactions to '{filename}'")
-
     except IOError as e:
         logging.error(f"Error writing to file '{filename}': {e}")
 
@@ -161,30 +172,37 @@ def main() -> None:
         description="Fetch ETH balance and recent transactions for an address."
     )
     parser.add_argument("address", help="Ethereum address")
-    parser.add_argument("apikey", help="Etherscan API key (or set ETHERSCAN_API_KEY env variable)")
+    parser.add_argument(
+        "apikey",
+        nargs="?",
+        default=os.getenv("ETHERSCAN_API_KEY"),
+        help="Etherscan API key (or set ETHERSCAN_API_KEY env variable)"
+    )
     parser.add_argument("--count", type=int, default=Config.DEFAULT_TRANSACTION_COUNT,
                         help=f"Number of transactions to fetch (default: {Config.DEFAULT_TRANSACTION_COUNT})")
     parser.add_argument("--csv", default=Config.DEFAULT_CSV_FILENAME,
                         help=f"CSV output filename (default: {Config.DEFAULT_CSV_FILENAME})")
 
     args = parser.parse_args()
-    api_key = args.apikey or os.getenv("ETHERSCAN_API_KEY")
+
+    if not args.apikey:
+        parser.error("Etherscan API key is required. Pass as argument or set ETHERSCAN_API_KEY env variable.")
 
     logging.info(f"Analyzing address: {args.address}")
 
-    balance = get_eth_balance(args.address, api_key)
+    balance = get_eth_balance(args.address, args.apikey)
     if balance is not None:
         logging.info(f"Balance: {balance:.6f} ETH")
     else:
         logging.error("Failed to retrieve ETH balance.")
 
-    eth_price = get_eth_price(api_key)
+    eth_price = get_eth_price(args.apikey)
     if eth_price is not None:
         logging.info(f"Current ETH Price: ${eth_price:.2f}")
     else:
         logging.warning("ETH price unavailable.")
 
-    transactions = get_last_transactions(args.address, api_key, args.count)
+    transactions = get_last_transactions(args.address, args.apikey, args.count)
     logging.info(f"Fetched {len(transactions)} transactions.")
 
     if transactions:
