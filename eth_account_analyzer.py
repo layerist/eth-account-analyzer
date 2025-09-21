@@ -1,6 +1,7 @@
 import argparse
 import csv
 import logging
+import os
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,7 @@ def get_session() -> requests.Session:
         backoff_factor=1
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
@@ -60,6 +62,14 @@ def make_request(session: requests.Session, params: Dict[str, str]) -> Optional[
     return None
 
 
+def _to_eth(value: str) -> Optional[float]:
+    """Convert a Wei string value to ETH float."""
+    try:
+        return int(value) / Config.WEI_TO_ETH
+    except (ValueError, TypeError):
+        return None
+
+
 def get_eth_balance(session: requests.Session, address: str, api_key: str) -> Optional[float]:
     """Retrieve ETH balance for a given address."""
     params = {
@@ -71,10 +81,10 @@ def get_eth_balance(session: requests.Session, address: str, api_key: str) -> Op
     }
     data = make_request(session, params)
     if data:
-        try:
-            return int(data["result"]) / Config.WEI_TO_ETH
-        except (ValueError, KeyError):
-            logging.exception("Failed to parse ETH balance.")
+        balance = _to_eth(data.get("result", "0"))
+        if balance is not None:
+            return balance
+        logging.error("Failed to parse ETH balance.")
     return None
 
 
@@ -90,7 +100,7 @@ def get_eth_price(session: requests.Session, api_key: str) -> Optional[float]:
         try:
             return float(data["result"]["ethusd"])
         except (ValueError, KeyError):
-            logging.exception("Failed to parse ETH price.")
+            logging.error("Failed to parse ETH price.")
     return None
 
 
@@ -115,17 +125,18 @@ def calculate_transaction_totals(transactions: List[Dict[str, Any]], address: st
     address = address.lower()
 
     for tx in transactions:
-        try:
-            value_eth = int(tx.get("value", 0)) / Config.WEI_TO_ETH
-            from_addr = tx.get("from", "").lower()
-            to_addr = tx.get("to", "").lower()
-
-            if to_addr == address:
-                total_in += value_eth
-            elif from_addr == address:
-                total_out += value_eth
-        except (ValueError, TypeError):
+        value_eth = _to_eth(tx.get("value", "0"))
+        if value_eth is None:
             logging.warning(f"Skipping malformed transaction: {tx}")
+            continue
+
+        from_addr = tx.get("from", "").lower()
+        to_addr = tx.get("to", "").lower()
+
+        if to_addr == address:
+            total_in += value_eth
+        elif from_addr == address:
+            total_out += value_eth
 
     return total_in, total_out
 
@@ -145,17 +156,17 @@ def save_transactions_to_csv(
         "value (ETH)", "value (USD)", "gas", "gasPrice (Gwei)"
     ]
 
-    try:
-        sorted_txs = sorted(transactions, key=lambda tx: int(tx.get("timeStamp", 0)), reverse=True)
+    sorted_txs = sorted(transactions, key=lambda tx: int(tx.get("timeStamp", 0)), reverse=True)
+    path = Path(filename)
 
-        path = Path(filename)
+    try:
         with path.open(mode="w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
 
             for tx in sorted_txs:
+                value_eth = _to_eth(tx.get("value", "0")) or 0.0
                 try:
-                    value_eth = int(tx.get("value", 0)) / Config.WEI_TO_ETH
                     writer.writerow({
                         "hash": tx.get("hash", ""),
                         "blockNumber": tx.get("blockNumber", ""),
@@ -167,7 +178,7 @@ def save_transactions_to_csv(
                         "gas": tx.get("gas", ""),
                         "gasPrice (Gwei)": round(int(tx.get("gasPrice", 0)) / 1e9, 2)
                     })
-                except (ValueError, KeyError, TypeError) as e:
+                except Exception as e:
                     logging.warning(f"Skipping invalid transaction row: {e}")
 
         logging.info(f"Saved {len(sorted_txs)} transactions to '{path.resolve()}'")
@@ -198,7 +209,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    api_key = args.apikey or Path.getenv("ETHERSCAN_API_KEY")
+    api_key = args.apikey or os.getenv("ETHERSCAN_API_KEY")
 
     if not api_key:
         parser.error("Etherscan API key is required. Pass as argument or set ETHERSCAN_API_KEY env variable.")
