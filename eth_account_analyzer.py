@@ -2,40 +2,45 @@
 """
 Etherscan Transaction Analyzer
 ------------------------------
-Fetches Ethereum balance, price, and latest transactions for a given address.
-Outputs a CSV file with detailed transaction data.
+Fetches Ethereum balance, price, and recent transactions for a given address.
+Outputs a CSV or JSON file with detailed transaction data.
 """
 
 import argparse
 import csv
+import json
 import logging
 import os
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
+from tabulate import tabulate
 
 
 @dataclass(frozen=True)
 class Config:
-    """Static configuration constants."""
     BASE_URL: str = "https://api.etherscan.io/api"
     WEI_TO_ETH: int = 10 ** 18
-    DEFAULT_CSV_FILENAME: str = "transactions.csv"
-    DEFAULT_TRANSACTION_COUNT: int = 10
+    DEFAULT_TX_COUNT: int = 10
     TIMEOUT: int = 10
     RETRIES: int = 3
+    CSV_DEFAULT: str = "transactions.csv"
 
 
-# Configure logging
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S"
 )
 
+
+# ----------------------------- Network Layer ----------------------------- #
 
 def create_session() -> requests.Session:
     """Create a requests session with retry logic."""
@@ -53,14 +58,14 @@ def create_session() -> requests.Session:
 
 
 def make_request(session: requests.Session, params: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    """Perform an HTTP GET request to the Etherscan API."""
+    """Perform GET request with retries and error handling."""
     try:
         response = session.get(Config.BASE_URL, params=params, timeout=Config.TIMEOUT)
         response.raise_for_status()
         data = response.json()
-
         if data.get("status") != "1" or "result" not in data:
-            logging.error(f"Etherscan API returned an error: {data.get('message', 'Unknown')}")
+            msg = data.get("message", "Unknown error")
+            logging.error(f"Etherscan API error: {msg}")
             return None
         return data
     except (requests.RequestException, ValueError) as e:
@@ -68,46 +73,40 @@ def make_request(session: requests.Session, params: Dict[str, str]) -> Optional[
         return None
 
 
-def wei_to_eth(value: str) -> Optional[float]:
-    """Convert Wei (string) to ETH (float)."""
+# ----------------------------- Utility Functions ----------------------------- #
+
+def wei_to_eth(value: str) -> float:
+    """Convert Wei (string) to ETH."""
     try:
         return int(value) / Config.WEI_TO_ETH
     except (ValueError, TypeError):
-        return None
+        return 0.0
 
+
+def eth_to_usd(eth_value: float, price: Optional[float]) -> float:
+    """Convert ETH to USD safely."""
+    return round(eth_value * price, 2) if (price and eth_value) else 0.0
+
+
+# ----------------------------- API Functions ----------------------------- #
 
 def get_eth_balance(session: requests.Session, address: str, api_key: str) -> Optional[float]:
-    """Retrieve the ETH balance for the specified address."""
-    params = {
-        "module": "account",
-        "action": "balance",
-        "address": address,
-        "tag": "latest",
-        "apikey": api_key,
-    }
+    params = {"module": "account", "action": "balance", "address": address, "tag": "latest", "apikey": api_key}
     data = make_request(session, params)
     return wei_to_eth(data["result"]) if data else None
 
 
 def get_eth_price(session: requests.Session, api_key: str) -> Optional[float]:
-    """Retrieve the current ETH price in USD."""
-    params = {
-        "module": "stats",
-        "action": "ethprice",
-        "apikey": api_key,
-    }
+    params = {"module": "stats", "action": "ethprice", "apikey": api_key}
     data = make_request(session, params)
-    if not data:
-        return None
     try:
-        return float(data["result"]["ethusd"])
-    except (KeyError, ValueError):
-        logging.error("Failed to parse ETH price.")
+        return float(data["result"]["ethusd"]) if data else None
+    except (KeyError, ValueError, TypeError):
+        logging.warning("Failed to parse ETH price.")
         return None
 
 
 def get_recent_transactions(session: requests.Session, address: str, api_key: str, limit: int) -> List[Dict[str, Any]]:
-    """Fetch the most recent transactions for the given Ethereum address."""
     params = {
         "module": "account",
         "action": "txlist",
@@ -121,111 +120,118 @@ def get_recent_transactions(session: requests.Session, address: str, api_key: st
     return data["result"][:limit] if data else []
 
 
+# ----------------------------- Processing ----------------------------- #
+
 def summarize_transactions(transactions: List[Dict[str, Any]], address: str) -> Tuple[float, float]:
-    """Calculate the total ETH received and sent for an address."""
+    """Summarize total in/out for the address."""
     address = address.lower()
-    total_in, total_out = 0.0, 0.0
-
-    for tx in transactions:
-        value = wei_to_eth(tx.get("value", "0"))
-        if value is None:
-            continue
-
-        if tx.get("to", "").lower() == address:
-            total_in += value
-        elif tx.get("from", "").lower() == address:
-            total_out += value
-
+    total_in = sum(wei_to_eth(tx["value"]) for tx in transactions if tx.get("to", "").lower() == address)
+    total_out = sum(wei_to_eth(tx["value"]) for tx in transactions if tx.get("from", "").lower() == address)
     return total_in, total_out
 
 
-def save_transactions_to_csv(transactions: List[Dict[str, Any]], filename: str, eth_price: Optional[float]) -> None:
-    """Save transaction data to a CSV file."""
+# ----------------------------- Output ----------------------------- #
+
+def save_csv(transactions: List[Dict[str, Any]], filename: str, eth_price: Optional[float]) -> None:
+    """Save transactions as CSV."""
     if not transactions:
-        logging.warning("No transactions to write to CSV.")
+        logging.warning("No transactions to save.")
         return
 
-    output_path = Path(filename)
-    fieldnames = [
-        "hash", "blockNumber", "timeStamp", "from", "to",
-        "value (ETH)", "value (USD)", "gas", "gasPrice (Gwei)"
-    ]
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_file = Path(filename).with_stem(Path(filename).stem + f"_{timestamp}")
 
-    try:
-        with output_path.open("w", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
+    fieldnames = ["hash", "blockNumber", "timeStamp", "from", "to", "value (ETH)", "value (USD)", "gas", "gasPrice (Gwei)"]
 
-            for tx in sorted(transactions, key=lambda t: int(t["timeStamp"]), reverse=True):
-                value_eth = wei_to_eth(tx.get("value", "0")) or 0.0
-                value_usd = round(value_eth * eth_price, 2) if eth_price else ""
+    with output_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
 
-                writer.writerow({
-                    "hash": tx.get("hash", ""),
-                    "blockNumber": tx.get("blockNumber", ""),
-                    "timeStamp": datetime.utcfromtimestamp(int(tx.get("timeStamp", 0))).isoformat(),
-                    "from": tx.get("from", ""),
-                    "to": tx.get("to", ""),
-                    "value (ETH)": round(value_eth, 6),
-                    "value (USD)": value_usd,
-                    "gas": tx.get("gas", ""),
-                    "gasPrice (Gwei)": round(int(tx.get("gasPrice", 0)) / 1e9, 2),
-                })
+        for tx in sorted(transactions, key=lambda t: int(t["timeStamp"]), reverse=True):
+            value_eth = wei_to_eth(tx["value"])
+            writer.writerow({
+                "hash": tx["hash"],
+                "blockNumber": tx["blockNumber"],
+                "timeStamp": datetime.utcfromtimestamp(int(tx["timeStamp"])).isoformat(),
+                "from": tx["from"],
+                "to": tx["to"],
+                "value (ETH)": round(value_eth, 6),
+                "value (USD)": eth_to_usd(value_eth, eth_price),
+                "gas": tx["gas"],
+                "gasPrice (Gwei)": round(int(tx["gasPrice"]) / 1e9, 2)
+            })
 
-        logging.info(f"✅ Saved {len(transactions)} transactions to '{output_path.resolve()}'")
-    except Exception as e:
-        logging.error(f"Failed to write CSV file '{filename}': {e}")
+    logging.info(f"✅ Saved {len(transactions)} transactions to: {output_file.resolve()}")
 
+
+def save_json(transactions: List[Dict[str, Any]], filename: str) -> None:
+    """Save transactions as JSON."""
+    output_file = Path(filename).with_suffix(".json")
+    with output_file.open("w", encoding="utf-8") as f:
+        json.dump(transactions, f, indent=2)
+    logging.info(f"✅ Saved JSON output to: {output_file.resolve()}")
+
+
+def print_summary(address: str, balance: Optional[float], price: Optional[float],
+                  total_in: float, total_out: float, transactions: List[Dict[str, Any]]) -> None:
+    """Print human-readable summary."""
+    print("\n📊 Ethereum Address Summary")
+    print("=" * 50)
+    print(f"Address: {address}")
+    print(f"Balance: {balance or 0:.6f} ETH")
+    print(f"ETH Price: ${price or 0:.2f}")
+    print(f"Total Received: {total_in:.6f} ETH | Total Sent: {total_out:.6f} ETH")
+    print(f"Transactions Retrieved: {len(transactions)}\n")
+
+    if transactions:
+        table = [
+            [
+                tx["hash"][:10] + "...",
+                tx["from"][:10] + "...",
+                tx["to"][:10] + "...",
+                round(wei_to_eth(tx["value"]), 6),
+                datetime.utcfromtimestamp(int(tx["timeStamp"])).strftime("%Y-%m-%d %H:%M:%S")
+            ]
+            for tx in transactions[:10]
+        ]
+        print(tabulate(table, headers=["Hash", "From", "To", "Value (ETH)", "Time"], tablefmt="fancy_grid"))
+
+
+# ----------------------------- CLI ----------------------------- #
 
 def main() -> None:
-    """CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="Fetch ETH balance, price, and transactions for an Ethereum address."
-    )
-    parser.add_argument("address", help="Ethereum address to analyze")
-    parser.add_argument(
-        "apikey",
-        nargs="?",
-        default=os.getenv("ETHERSCAN_API_KEY"),
-        help="Etherscan API key (or set ETHERSCAN_API_KEY environment variable)"
-    )
-    parser.add_argument(
-        "--count", type=int, default=Config.DEFAULT_TRANSACTION_COUNT,
-        help=f"Number of transactions to fetch (default: {Config.DEFAULT_TRANSACTION_COUNT})"
-    )
-    parser.add_argument(
-        "--csv", default=Config.DEFAULT_CSV_FILENAME,
-        help=f"CSV output filename (default: {Config.DEFAULT_CSV_FILENAME})"
-    )
-
+    parser = argparse.ArgumentParser(description="Analyze Ethereum transactions via Etherscan API.")
+    parser.add_argument("address", help="Ethereum address")
+    parser.add_argument("apikey", nargs="?", default=os.getenv("ETHERSCAN_API_KEY"), help="Etherscan API key")
+    parser.add_argument("--count", type=int, default=Config.DEFAULT_TX_COUNT, help="Number of recent transactions")
+    parser.add_argument("--csv", default=Config.CSV_DEFAULT, help="CSV output filename")
+    parser.add_argument("--json", action="store_true", help="Also export JSON")
     args = parser.parse_args()
 
     if not args.apikey:
-        parser.error("Missing Etherscan API key. Use argument or environment variable ETHERSCAN_API_KEY.")
+        parser.error("Missing Etherscan API key (use arg or ENV ETHERSCAN_API_KEY).")
 
     session = create_session()
-    logging.info(f"Analyzing Ethereum address: {args.address}")
+    logging.info(f"🔍 Fetching data for {args.address}")
 
-    balance = get_eth_balance(session, args.address, args.apikey)
-    eth_price = get_eth_price(session, args.apikey)
-    transactions = get_recent_transactions(session, args.address, args.apikey, args.count)
+    # Fetch all concurrently
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            "balance": executor.submit(get_eth_balance, session, args.address, args.apikey),
+            "price": executor.submit(get_eth_price, session, args.apikey),
+            "tx": executor.submit(get_recent_transactions, session, args.address, args.apikey, args.count)
+        }
+        results = {k: f.result() for k, f in futures.items()}
 
-    if balance is not None:
-        logging.info(f"💰 Balance: {balance:.6f} ETH")
-    else:
-        logging.warning("Could not fetch balance.")
+    balance, price, transactions = results["balance"], results["price"], results["tx"]
 
-    if eth_price is not None:
-        logging.info(f"📈 Current ETH Price: ${eth_price:.2f}")
-    else:
-        logging.warning("Could not fetch ETH price.")
-
-    logging.info(f"📜 Retrieved {len(transactions)} transactions.")
+    total_in, total_out = summarize_transactions(transactions, args.address)
+    print_summary(args.address, balance, price, total_in, total_out, transactions)
 
     if transactions:
-        total_in, total_out = summarize_transactions(transactions, args.address)
-        logging.info(f"🔹 Total Received: {total_in:.6f} ETH | 🔸 Total Sent: {total_out:.6f} ETH")
-        save_transactions_to_csv(transactions, args.csv, eth_price)
+        save_csv(transactions, args.csv, price)
+        if args.json:
+            save_json(transactions, args.csv)
 
 
 if __name__ == "__main__":
