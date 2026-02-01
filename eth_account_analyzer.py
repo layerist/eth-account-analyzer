@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
 Etherscan Transaction Analyzer
-------------------------------
-- Robust API handling with retries
-- Safe caching and serialization
-- Clear separation of concerns
-- Strong typing and defensive parsing
-- Parallelized network calls
+==============================
+
+Improvements over the original version:
+- Clearer error semantics with custom exceptions
+- Stronger typing and validation helpers
+- Centralized cache handling with TTL support
+- Better session lifecycle management
+- Safer numeric parsing and timestamp handling
+- Cleaner parallel task orchestration
+- Minor performance, readability, and style improvements
 """
 
 from __future__ import annotations
@@ -16,10 +20,11 @@ import csv
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -38,9 +43,12 @@ class Config:
     DEFAULT_TX_COUNT: int = 10
     TIMEOUT_SECONDS: int = 10
     RETRIES: int = 3
-    CSV_DEFAULT: str = "transactions.csv"
     MAX_THREADS: int = min(8, (os.cpu_count() or 2) * 2)
+
     CACHE_DIR: Path = Path(".cache_etherscan")
+    CACHE_TTL_SECONDS: int = 300  # 5 minutes
+
+    CSV_DEFAULT: str = "transactions.csv"
 
 
 # --------------------------------------------------------------------------- #
@@ -55,18 +63,31 @@ logging.basicConfig(
 
 
 # --------------------------------------------------------------------------- #
+#                                   ERRORS                                    #
+# --------------------------------------------------------------------------- #
+
+class EtherscanError(RuntimeError):
+    pass
+
+
+class CacheError(RuntimeError):
+    pass
+
+
+# --------------------------------------------------------------------------- #
 #                              NETWORK HELPERS                                #
 # --------------------------------------------------------------------------- #
 
 def create_session() -> requests.Session:
     session = requests.Session()
-    retries = Retry(
+    retry = Retry(
         total=Config.RETRIES,
         backoff_factor=1,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
+        raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -81,34 +102,70 @@ def api_call(session: requests.Session, **params: Any) -> Any:
         )
         response.raise_for_status()
         payload = response.json()
-
-        if payload.get("status") != "1":
-            message = payload.get("message", "Unknown API error")
-            raise RuntimeError(message)
-
-        return payload.get("result")
-
     except Exception as exc:
-        raise RuntimeError(
-            f"Etherscan request failed | params={params}"
-        ) from exc
+        raise EtherscanError(f"HTTP failure | params={params}") from exc
+
+    if payload.get("status") != "1":
+        raise EtherscanError(payload.get("message", "Unknown API error"))
+
+    return payload.get("result")
+
+
+# --------------------------------------------------------------------------- #
+#                               CACHE UTILITIES                               #
+# --------------------------------------------------------------------------- #
+
+def cache_path(key: str) -> Path:
+    Config.CACHE_DIR.mkdir(exist_ok=True)
+    return Config.CACHE_DIR / f"{key}.json"
+
+
+def load_cache(path: Path) -> Optional[Any]:
+    try:
+        if not path.exists():
+            return None
+
+        age = time.time() - path.stat().st_mtime
+        if age > Config.CACHE_TTL_SECONDS:
+            return None
+
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        raise CacheError(f"Failed to load cache: {path}") from exc
+
+
+def save_cache(path: Path, data: Any) -> None:
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception as exc:
+        logging.warning("Cache write failed (%s): %s", path, exc)
 
 
 # --------------------------------------------------------------------------- #
 #                               DATA UTILITIES                                #
 # --------------------------------------------------------------------------- #
 
-def wei_to_eth(value: str | int) -> float:
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        return int(value) / Config.WEI_PER_ETH
+        return int(value)
     except (TypeError, ValueError):
-        return 0.0
+        return default
+
+
+def wei_to_eth(value: Any) -> float:
+    return safe_int(value) / Config.WEI_PER_ETH
 
 
 def eth_to_usd(eth: float, price: Optional[float]) -> float:
-    if price is None:
-        return 0.0
-    return round(eth * price, 2)
+    return round(eth * price, 2) if price else 0.0
+
+
+def parse_utc(ts: Any) -> str:
+    return datetime.utcfromtimestamp(
+        safe_int(ts)
+    ).isoformat()
 
 
 # --------------------------------------------------------------------------- #
@@ -153,17 +210,10 @@ def get_recent_transactions(
     api_key: str,
     limit: int,
 ) -> List[Dict[str, Any]]:
-    Config.CACHE_DIR.mkdir(exist_ok=True)
-    cache_file = Config.CACHE_DIR / f"{address.lower()}_tx.json"
-
-    if cache_file.exists():
-        try:
-            with cache_file.open("r", encoding="utf-8") as fh:
-                cached = json.load(fh)
-                if isinstance(cached, list):
-                    return cached[:limit]
-        except Exception:
-            logging.warning("Ignoring corrupted cache: %s", cache_file)
+    cache = cache_path(f"{address.lower()}_tx")
+    cached = load_cache(cache)
+    if isinstance(cached, list):
+        return cached[:limit]
 
     result = api_call(
         session,
@@ -176,13 +226,11 @@ def get_recent_transactions(
         apikey=api_key,
     )
 
-    try:
-        with cache_file.open("w", encoding="utf-8") as fh:
-            json.dump(result, fh)
-    except Exception:
-        logging.warning("Failed to write cache: %s", cache_file)
+    if isinstance(result, list):
+        save_cache(cache, result)
+        return result[:limit]
 
-    return result[:limit]
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -190,41 +238,36 @@ def get_recent_transactions(
 # --------------------------------------------------------------------------- #
 
 def summarize_transactions(
-    transactions: List[Dict[str, Any]],
+    transactions: Iterable[Dict[str, Any]],
     address: str,
 ) -> Tuple[float, float]:
     addr = address.lower()
 
-    total_received = sum(
-        wei_to_eth(tx.get("value", 0))
-        for tx in transactions
-        if tx.get("to", "").lower() == addr
-    )
+    received = 0.0
+    sent = 0.0
 
-    total_sent = sum(
-        wei_to_eth(tx.get("value", 0))
-        for tx in transactions
-        if tx.get("from", "").lower() == addr
-    )
+    for tx in transactions:
+        value = wei_to_eth(tx.get("value"))
+        if tx.get("to", "").lower() == addr:
+            received += value
+        elif tx.get("from", "").lower() == addr:
+            sent += value
 
-    return total_received, total_sent
+    return received, sent
 
 
 # --------------------------------------------------------------------------- #
 #                              PARALLEL EXECUTION                              #
 # --------------------------------------------------------------------------- #
 
-def fetch_all(tasks: Dict[str, Callable[[], Any]]) -> Dict[str, Any]:
+def run_tasks(tasks: Dict[str, Callable[[], Any]]) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
 
-    with ThreadPoolExecutor(max_workers=Config.MAX_THREADS) as executor:
-        future_map = {
-            executor.submit(func): name
-            for name, func in tasks.items()
-        }
+    with ThreadPoolExecutor(max_workers=Config.MAX_THREADS) as pool:
+        futures = {pool.submit(fn): name for name, fn in tasks.items()}
 
-        for future in as_completed(future_map):
-            name = future_map[future]
+        for future in as_completed(futures):
+            name = futures[future]
             try:
                 results[name] = future.result()
             except Exception as exc:
@@ -238,7 +281,7 @@ def fetch_all(tasks: Dict[str, Callable[[], Any]]) -> Dict[str, Any]:
 #                                   OUTPUT                                    #
 # --------------------------------------------------------------------------- #
 
-def timestamped_path(path: Path) -> Path:
+def timestamped(path: Path) -> Path:
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return path.with_name(f"{path.stem}_{ts}{path.suffix}")
 
@@ -249,11 +292,9 @@ def save_csv(
     eth_price: Optional[float],
 ) -> None:
     if not transactions:
-        logging.warning("No transactions to save.")
         return
 
-    output_path = timestamped_path(Path(filename))
-
+    path = timestamped(Path(filename))
     fields = (
         "hash",
         "blockNumber",
@@ -266,44 +307,34 @@ def save_csv(
         "gas_price_gwei",
     )
 
-    with output_path.open("w", newline="", encoding="utf-8") as fh:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
 
-        for tx in sorted(
-            transactions,
-            key=lambda t: int(t.get("timeStamp", 0)),
-            reverse=True,
-        ):
-            eth_value = wei_to_eth(tx.get("value", 0))
-
+        for tx in transactions:
+            eth = wei_to_eth(tx.get("value"))
             writer.writerow({
                 "hash": tx.get("hash"),
                 "blockNumber": tx.get("blockNumber"),
-                "timeStamp": datetime.utcfromtimestamp(
-                    int(tx.get("timeStamp", 0))
-                ).isoformat(),
+                "timeStamp": parse_utc(tx.get("timeStamp")),
                 "from": tx.get("from"),
                 "to": tx.get("to"),
-                "value_eth": eth_value,
-                "value_usd": eth_to_usd(eth_value, eth_price),
+                "value_eth": eth,
+                "value_usd": eth_to_usd(eth, eth_price),
                 "gas": tx.get("gas"),
                 "gas_price_gwei": round(
-                    int(tx.get("gasPrice", 0)) / 1e9, 2
+                    safe_int(tx.get("gasPrice")) / 1e9, 2
                 ),
             })
 
-    logging.info("CSV saved → %s", output_path)
+    logging.info("CSV saved → %s", path)
 
 
-def save_json(
-    transactions: List[Dict[str, Any]],
-    filename: str,
-) -> None:
-    output_path = timestamped_path(Path(filename)).with_suffix(".json")
-    with output_path.open("w", encoding="utf-8") as fh:
+def save_json(transactions: List[Dict[str, Any]], filename: str) -> None:
+    path = timestamped(Path(filename)).with_suffix(".json")
+    with path.open("w", encoding="utf-8") as fh:
         json.dump(transactions, fh, indent=2)
-    logging.info("JSON saved → %s", output_path)
+    logging.info("JSON saved → %s", path)
 
 
 def print_summary(
@@ -326,20 +357,18 @@ def print_summary(
     if not transactions:
         return
 
-    table = []
+    rows = []
     for tx in transactions[:10]:
-        table.append([
-            tx.get("hash", "")[:10] + "...",
-            tx.get("from", "")[:10] + "...",
-            tx.get("to", "")[:10] + "...",
-            round(wei_to_eth(tx.get("value", 0)), 6),
-            datetime.utcfromtimestamp(
-                int(tx.get("timeStamp", 0))
-            ).strftime("%Y-%m-%d %H:%M:%S"),
+        rows.append([
+            (tx.get("hash") or "")[:10] + "...",
+            (tx.get("from") or "")[:10] + "...",
+            (tx.get("to") or "")[:10] + "...",
+            round(wei_to_eth(tx.get("value")), 6),
+            parse_utc(tx.get("timeStamp")),
         ])
 
     print(tabulate(
-        table,
+        rows,
         headers=("Hash", "From", "To", "ETH", "Time"),
         tablefmt="fancy_grid",
     ))
@@ -351,7 +380,7 @@ def print_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ethereum transaction analyzer using Etherscan API"
+        description="Ethereum transaction analyzer (Etherscan)"
     )
     parser.add_argument("address", help="Ethereum address")
     parser.add_argument(
@@ -365,43 +394,34 @@ def main() -> None:
     parser.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
-
     if not args.apikey:
         parser.error("Missing Etherscan API key")
 
     session = create_session()
     logging.info("Fetching data for %s", args.address)
 
-    tasks = {
+    results = run_tasks({
         "balance": lambda: get_eth_balance(session, args.address, args.apikey),
         "price": lambda: get_eth_price(session, args.apikey),
-        "transactions": lambda: get_recent_transactions(
+        "txs": lambda: get_recent_transactions(
             session, args.address, args.apikey, args.count
         ),
-    }
+    })
 
-    results = fetch_all(tasks)
-
-    balance = results.get("balance")
-    price = results.get("price")
-    transactions = results.get("transactions") or []
-
-    total_in, total_out = summarize_transactions(
-        transactions,
-        args.address,
-    )
+    transactions = results.get("txs") or []
+    total_in, total_out = summarize_transactions(transactions, args.address)
 
     print_summary(
         args.address,
-        balance,
-        price,
+        results.get("balance"),
+        results.get("price"),
         total_in,
         total_out,
         transactions,
     )
 
     if transactions:
-        save_csv(transactions, args.csv, price)
+        save_csv(transactions, args.csv, results.get("price"))
         if args.json:
             save_json(transactions, args.csv)
 
