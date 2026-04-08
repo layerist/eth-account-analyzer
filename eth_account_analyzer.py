@@ -27,14 +27,19 @@ from tabulate import tabulate
 @dataclass(frozen=True)
 class Config:
     BASE_URL: str = "https://api.etherscan.io/api"
+
     WEI_PER_ETH: Decimal = Decimal("1000000000000000000")
+
     DEFAULT_TX_COUNT: int = 10
     TIMEOUT_SECONDS: int = 10
     RETRIES: int = 3
-    MAX_THREADS: int = min(8, (os.cpu_count() or 2) * 2)
+
+    MAX_THREADS: int = min(6, (os.cpu_count() or 2) * 2)
 
     CACHE_DIR: Path = Path(".cache_etherscan")
     CACHE_TTL_SECONDS: int = 300
+
+    RATE_LIMIT_PER_SEC: float = 4.5  # safe for free tier
 
 
 # --------------------------------------------------------------------------- #
@@ -43,9 +48,11 @@ class Config:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%H:%M:%S",
 )
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -61,7 +68,29 @@ class ValidationError(ValueError):
 
 
 # --------------------------------------------------------------------------- #
-# THREAD-LOCAL SESSION (IMPORTANT FIX)
+# RATE LIMITER
+# --------------------------------------------------------------------------- #
+
+class RateLimiter:
+    def __init__(self, rate: float):
+        self.min_interval = 1.0 / rate
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            delta = now - self.last
+            if delta < self.min_interval:
+                time.sleep(self.min_interval - delta)
+            self.last = time.time()
+
+
+rate_limiter = RateLimiter(Config.RATE_LIMIT_PER_SEC)
+
+
+# --------------------------------------------------------------------------- #
+# THREAD-LOCAL SESSION
 # --------------------------------------------------------------------------- #
 
 _thread_local = threading.local()
@@ -73,12 +102,12 @@ def get_session() -> requests.Session:
 
         retry = Retry(
             total=Config.RETRIES,
-            backoff_factor=0.8,
+            backoff_factor=0.7,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=("GET",),
         )
 
-        adapter = HTTPAdapter(max_retries=retry)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
 
@@ -116,13 +145,13 @@ def cache_path(key: Dict[str, Any]) -> Path:
 
 
 def load_cache(path: Path) -> Optional[Any]:
-    if not path.exists():
-        return None
-
-    if time.time() - path.stat().st_mtime > Config.CACHE_TTL_SECONDS:
-        return None
-
     try:
+        if not path.exists():
+            return None
+
+        if time.time() - path.stat().st_mtime > Config.CACHE_TTL_SECONDS:
+            return None
+
         return json.loads(path.read_text())
     except Exception:
         return None
@@ -132,7 +161,7 @@ def save_cache(path: Path, data: Any) -> None:
     try:
         path.write_text(json.dumps(data))
     except Exception as exc:
-        logging.debug("Cache write failed: %s", exc)
+        log.debug("Cache write failed: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +170,9 @@ def save_cache(path: Path, data: Any) -> None:
 
 def api_call(**params: Any) -> Any:
     session = get_session()
+
+    # include API key in cache identity isolation if needed externally
+    rate_limiter.wait()
 
     try:
         r = session.get(
@@ -157,13 +189,19 @@ def api_call(**params: Any) -> Any:
     except Exception:
         raise EtherscanError("Invalid JSON response")
 
-    # FIX: allow empty results
-    if data.get("status") == "0":
-        if data.get("message") == "No transactions found":
-            return []
-        raise EtherscanError(data.get("message", "API error"))
+    status = data.get("status")
+    message = data.get("message", "")
+    result = data.get("result")
 
-    return data.get("result")
+    # handle etherscan quirks
+    if status == "0":
+        if message in ("No transactions found", "No records found"):
+            return []
+        if "rate limit" in str(result).lower():
+            raise EtherscanError("Rate limit hit")
+        raise EtherscanError(message or "API error")
+
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -178,12 +216,12 @@ def safe_decimal(v: Any) -> Decimal:
 
 
 def wei_to_eth(v: Any) -> Decimal:
-    return (safe_decimal(v) / Config.WEI_PER_ETH).quantize(Decimal("0.000000000000000001"))
+    return safe_decimal(v) / Config.WEI_PER_ETH
 
 
 def parse_utc(ts: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return "N/A"
 
@@ -216,13 +254,14 @@ def get_transactions(address: str, api_key: str, limit: int) -> List[Dict[str, A
         "module": "account",
         "action": "txlist",
         "address": address,
+        "limit": limit,
     }
 
     path = cache_path(key)
-    cached = load_cache(path)
 
+    cached = load_cache(path)
     if cached:
-        return cached[:limit]
+        return cached
 
     result = api_call(
         module="account",
@@ -235,8 +274,9 @@ def get_transactions(address: str, api_key: str, limit: int) -> List[Dict[str, A
     )
 
     if isinstance(result, list):
-        save_cache(path, result)
-        return result[:limit]
+        trimmed = result[:limit]
+        save_cache(path, trimmed)
+        return trimmed
 
     return []
 
@@ -251,12 +291,10 @@ def summarize(transactions: Iterable[Dict[str, Any]], address: str) -> Tuple[Dec
 
     for tx in transactions:
         value = wei_to_eth(tx.get("value"))
-        to_addr = (tx.get("to") or "").lower()
-        from_addr = (tx.get("from") or "").lower()
 
-        if to_addr == address:
+        if (tx.get("to") or "").lower() == address:
             received += value
-        elif from_addr == address:
+        elif (tx.get("from") or "").lower() == address:
             sent += value
 
     return received, sent
@@ -269,15 +307,15 @@ def summarize(transactions: Iterable[Dict[str, Any]], address: str) -> Tuple[Dec
 def run_tasks(tasks: Dict[str, Callable[[], Any]]) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
 
-    with ThreadPoolExecutor(max_workers=Config.MAX_THREADS) as ex:
-        futures = {ex.submit(fn): name for name, fn in tasks.items()}
+    with ThreadPoolExecutor(max_workers=Config.MAX_THREADS) as executor:
+        futures = {executor.submit(fn): name for name, fn in tasks.items()}
 
-        for f in as_completed(futures):
-            name = futures[f]
+        for future in as_completed(futures):
+            name = futures[future]
             try:
-                results[name] = f.result()
-            except Exception as e:
-                logging.error("%s failed: %s", name, e)
+                results[name] = future.result()
+            except Exception as exc:
+                log.error("%s failed: %s", name, exc)
                 results[name] = None
 
     return results
@@ -300,10 +338,10 @@ def print_summary(address: str, balance, price, total_in, total_out, txs):
     rows = [
         [
             (tx.get("hash") or "")[:12],
-            wei_to_eth(tx.get("value")),
+            f"{wei_to_eth(tx.get('value')):.6f}",
             parse_utc(tx.get("timeStamp")),
         ]
-        for tx in txs[:10]
+        for tx in txs
     ]
 
     if rows:
@@ -315,23 +353,29 @@ def print_summary(address: str, balance, price, total_in, total_out, txs):
 # --------------------------------------------------------------------------- #
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Ethereum wallet analyzer (Etherscan)")
     parser.add_argument("address")
     parser.add_argument("--apikey", default=os.getenv("ETHERSCAN_API_KEY"))
     parser.add_argument("--count", type=int, default=Config.DEFAULT_TX_COUNT)
+    parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     if not args.apikey:
         parser.error("Missing API key")
 
     address = validate_eth_address(args.address)
 
-    results = run_tasks({
+    tasks = {
         "balance": lambda: get_eth_balance(address, args.apikey),
         "price": lambda: get_eth_price(args.apikey),
         "txs": lambda: get_transactions(address, args.apikey, args.count),
-    })
+    }
+
+    results = run_tasks(tasks)
 
     txs = results.get("txs") or []
     total_in, total_out = summarize(txs, address)
