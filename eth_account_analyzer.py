@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Etherscan wallet analyzer.
+"""Robust Etherscan wallet analyzer.
 
-Features:
-- Etherscan API V2 with configurable chain ID
-- shared, thread-safe request pacing
-- retry/backoff with Retry-After support
-- atomic TTL cache
-- parallel balance, price and transaction requests
-- transaction direction/status/fee reporting
-- JSON output suitable for scripts
+Highlights:
+- Etherscan API V2 with configurable chain ID and base URL
+- thread-safe global request pacing
+- bounded exponential backoff with Retry-After support
+- atomic TTL cache with schema versioning
+- parallel balance, price, and transaction requests
+- correct fixed-size pagination (no skipped rows)
+- precise Decimal-based value and fee calculations
+- partial-result reporting and machine-readable JSON
 
 Requires:
     pip install requests tabulate
@@ -17,6 +18,7 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import email.utils
 import hashlib
 import json
 import logging
@@ -38,12 +40,16 @@ from requests.adapters import HTTPAdapter
 from tabulate import tabulate
 
 
+APP_NAME = "etherscan-wallet-analyzer"
+APP_VERSION = "3.0"
+DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
+CACHE_SCHEMA_VERSION = 3
 LOG = logging.getLogger("etherscan_wallet")
 T = TypeVar("T")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 ZERO = Decimal("0")
-WEI = Decimal("1000000000000000000")
-GWEI = Decimal("1000000000")
+WEI = Decimal(10) ** 18
+MAX_RETRY_DELAY = 60.0
 
 
 class EtherscanError(RuntimeError):
@@ -51,7 +57,13 @@ class EtherscanError(RuntimeError):
 
 
 class ValidationError(ValueError):
-    """CLI input validation failed."""
+    """User input or configuration validation failed."""
+
+
+class RetryableError(RuntimeError):
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -74,20 +86,22 @@ class TxView:
     timestamp: str
     direction: str
     counterparty: str
-    value_eth: Decimal
-    fee_eth: Decimal
+    value_native: Decimal
+    fee_native: Decimal
     status: str
     block_number: int
+    nonce: int
+    method_id: str
 
     def to_json(self) -> dict[str, Any]:
         result = asdict(self)
-        result["value_eth"] = decimal_text(self.value_eth)
-        result["fee_eth"] = decimal_text(self.fee_eth)
+        result["value_native"] = decimal_text(self.value_native)
+        result["fee_native"] = decimal_text(self.fee_native)
         return result
 
 
 class RateLimiter:
-    """Process-wide fixed-interval limiter based on monotonic time."""
+    """Thread-safe fixed-interval limiter based on monotonic time."""
 
     def __init__(self, calls_per_second: float) -> None:
         if calls_per_second <= 0:
@@ -122,13 +136,16 @@ class AtomicJsonCache:
             return None
         path = self._path(key)
         try:
+            stat = path.stat()
             if not path.is_file():
                 return None
-            age = time.time() - path.stat().st_mtime
+            age = max(0.0, time.time() - stat.st_mtime)
             if age > self.ttl:
                 path.unlink(missing_ok=True)
                 return None
             return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
         except (OSError, ValueError, TypeError) as exc:
             LOG.debug("Ignoring unreadable cache file %s: %s", path, exc)
             return None
@@ -162,22 +179,20 @@ class EtherscanClient:
         self._local = threading.local()
 
     def _session(self) -> requests.Session:
-        existing = getattr(self._local, "session", None)
-        if existing is not None:
-            return existing
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            return session
 
         session = requests.Session()
-        adapter = HTTPAdapter(
-            max_retries=0,  # retries are handled in request() to inspect API-level errors
-            pool_connections=8,
-            pool_maxsize=8,
-        )
+        adapter = HTTPAdapter(max_retries=0, pool_connections=4, pool_maxsize=4)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        session.headers.update({
-            "Accept": "application/json",
-            "User-Agent": "etherscan-wallet-analyzer/2.0",
-        })
+        session.headers.update(
+            {
+                "Accept": "application/json",
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            }
+        )
         self._local.session = session
         return session
 
@@ -197,25 +212,17 @@ class EtherscanClient:
                 response = self._session().get(
                     self.settings.base_url,
                     params=query,
-                    timeout=self.settings.timeout,
+                    timeout=(min(5.0, self.settings.timeout), self.settings.timeout),
                 )
 
-                if response.status_code == 429 or response.status_code >= 500:
-                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                if response.status_code == 429 or 500 <= response.status_code <= 599:
                     raise RetryableError(
-                        f"HTTP {response.status_code}", retry_after=retry_after
+                        f"HTTP {response.status_code}",
+                        retry_after=parse_retry_after(response.headers.get("Retry-After")),
                     )
 
                 response.raise_for_status()
-                try:
-                    payload = response.json()
-                except ValueError as exc:
-                    preview = response.text[:200].replace("\n", " ")
-                    raise EtherscanError(f"Invalid JSON response: {preview!r}") from exc
-
-                if not isinstance(payload, dict):
-                    raise EtherscanError("Unexpected API response type")
-
+                payload = decode_json_response(response)
                 status = str(payload.get("status", ""))
                 message = str(payload.get("message", ""))
                 result = payload.get("result")
@@ -224,7 +231,7 @@ class EtherscanClient:
                 if is_no_records(message, result):
                     return []
                 if is_retryable_api_error(combined):
-                    raise RetryableError(str(result or message or "rate limited"))
+                    raise RetryableError(str(result or message or "temporary API error"))
                 if status == "0":
                     detail = result if result not in (None, "") else message
                     raise EtherscanError(f"Etherscan {module}/{action}: {detail}")
@@ -239,12 +246,14 @@ class EtherscanClient:
                 last_error = exc
                 delay = backoff(attempt)
             except requests.HTTPError as exc:
-                raise EtherscanError(f"HTTP error: {exc}") from exc
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                preview = response_preview(exc.response)
+                raise EtherscanError(f"HTTP {status} for {module}/{action}: {preview}") from exc
 
             if attempt >= self.settings.retries:
                 break
             LOG.warning(
-                "%s/%s failed (%s), retrying in %.2fs [%d/%d]",
+                "%s/%s failed (%s); retrying in %.2fs [%d/%d]",
                 module,
                 action,
                 last_error,
@@ -260,19 +269,16 @@ class EtherscanClient:
         )
 
     def balance(self, address: str) -> Decimal:
-        result = self.request(
-            module="account", action="balance", address=address, tag="latest"
+        return wei_to_native(
+            self.request(module="account", action="balance", address=address, tag="latest")
         )
-        return wei_to_eth(result)
 
     def eth_price(self) -> Optional[Decimal]:
-        # ethprice is Ethereum-specific; for other chains it may be unavailable or
-        # still represent ETH rather than the chain's native token.
         try:
             result = self.request(module="stats", action="ethprice")
             if not isinstance(result, dict):
                 return None
-            return to_decimal(result.get("ethusd"), default=None)
+            return parse_decimal(result.get("ethusd"), field="ethusd", required=False)
         except EtherscanError as exc:
             LOG.warning("ETH/USD price unavailable: %s", exc)
             return None
@@ -282,7 +288,7 @@ class EtherscanClient:
             return []
 
         cache_key = {
-            "version": 2,
+            "schema": CACHE_SCHEMA_VERSION,
             "chain_id": self.settings.chain_id,
             "address": address,
             "count": count,
@@ -290,14 +296,14 @@ class EtherscanClient:
             "page_size": self.settings.page_size,
         }
         cached = self.cache.get(cache_key)
-        if isinstance(cached, list):
+        if isinstance(cached, list) and all(isinstance(row, dict) for row in cached):
             LOG.debug("Transaction cache hit")
             return cached
 
         collected: list[dict[str, Any]] = []
-        page = 1
-        while page <= self.settings.max_pages and len(collected) < count:
-            offset = min(self.settings.page_size, count - len(collected))
+        offset = min(self.settings.page_size, 10000)
+
+        for page in range(1, self.settings.max_pages + 1):
             result = self.request(
                 module="account",
                 action="txlist",
@@ -315,31 +321,56 @@ class EtherscanClient:
 
             rows = [row for row in result if isinstance(row, dict)]
             collected.extend(rows)
-            if len(rows) < offset:
+            if len(collected) >= count or len(result) < offset:
                 break
-            page += 1
+        else:
+            if len(collected) < count:
+                LOG.warning(
+                    "Reached --max-pages=%d before collecting %d transactions",
+                    self.settings.max_pages,
+                    count,
+                )
 
         collected = collected[:count]
         self.cache.put(cache_key, collected)
         return collected
 
 
-class RetryableError(RuntimeError):
-    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
+def decode_json_response(response: requests.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise EtherscanError(f"Invalid JSON response: {response_preview(response)!r}") from exc
+    if not isinstance(payload, dict):
+        raise EtherscanError(f"Unexpected API response type: {type(payload).__name__}")
+    return payload
+
+
+def response_preview(response: Optional[requests.Response], limit: int = 240) -> str:
+    if response is None:
+        return "no response body"
+    return response.text[:limit].replace("\r", " ").replace("\n", " ").strip() or "empty body"
 
 
 def backoff(attempt: int) -> float:
-    return min(20.0, 0.8 * (2**attempt)) + random.uniform(0.0, 0.25)
+    return min(20.0, 0.8 * (2**attempt)) + random.uniform(0.0, 0.35)
 
 
 def parse_retry_after(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
     try:
-        return max(0.0, min(float(value), 60.0))
+        return min(max(float(value), 0.0), MAX_RETRY_DELAY)
     except ValueError:
+        pass
+
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        return min(max(seconds, 0.0), MAX_RETRY_DELAY)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -350,6 +381,8 @@ def is_retryable_api_error(text: str) -> bool:
         "temporarily unavailable",
         "timeout",
         "server too busy",
+        "please try again",
+        "query timeout",
     )
     return any(marker in text for marker in markers)
 
@@ -360,42 +393,79 @@ def is_no_records(message: str, result: Any) -> bool:
 
 
 def validate_address(value: str) -> str:
-    value = value.strip()
-    if not ADDRESS_RE.fullmatch(value):
+    normalized = value.strip()
+    if not ADDRESS_RE.fullmatch(normalized):
         raise ValidationError("address must be 0x followed by exactly 40 hexadecimal characters")
-    return value.lower()
+    return normalized.lower()
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValidationError(f"{name} must be an integer, got {raw!r}") from exc
 
 
 def positive_int(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
     if number <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return number
 
 
 def non_negative_int(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
     if number < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
     return number
 
 
 def positive_float(value: str) -> float:
-    number = float(value)
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
     if number <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return number
 
 
-def to_decimal(value: Any, default: Optional[Decimal] = ZERO) -> Optional[Decimal]:
+def parse_decimal(value: Any, *, field: str, required: bool = True) -> Optional[Decimal]:
+    if value is None or value == "":
+        if required:
+            raise EtherscanError(f"Missing numeric field: {field}")
+        return None
     try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        if required:
+            raise EtherscanError(f"Invalid numeric field {field}: {value!r}") from exc
+        return None
+    if not number.is_finite():
+        if required:
+            raise EtherscanError(f"Non-finite numeric field {field}: {value!r}")
+        return None
+    return number
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return default
 
 
-def wei_to_eth(value: Any) -> Decimal:
-    return (to_decimal(value) or ZERO) / WEI
+def wei_to_native(value: Any) -> Decimal:
+    return (parse_decimal(value, field="wei") or ZERO) / WEI
 
 
 def decimal_text(value: Decimal) -> str:
@@ -424,9 +494,9 @@ def transaction_status(tx: Mapping[str, Any]) -> str:
     return "ok"
 
 
-def transaction_fee_eth(tx: Mapping[str, Any]) -> Decimal:
-    gas_used = to_decimal(tx.get("gasUsed")) or ZERO
-    gas_price = to_decimal(tx.get("gasPrice")) or ZERO
+def transaction_fee_native(tx: Mapping[str, Any]) -> Decimal:
+    gas_used = parse_decimal(tx.get("gasUsed"), field="gasUsed") or ZERO
+    gas_price = parse_decimal(tx.get("gasPrice"), field="gasPrice") or ZERO
     return (gas_used * gas_price) / WEI
 
 
@@ -435,6 +505,7 @@ def normalize_transactions(rows: Iterable[Mapping[str, Any]], address: str) -> l
     for tx in rows:
         sender = str(tx.get("from") or "").lower()
         recipient = str(tx.get("to") or "").lower()
+
         if sender == address and recipient == address:
             direction = "self"
             counterparty = address
@@ -448,16 +519,25 @@ def normalize_transactions(rows: Iterable[Mapping[str, Any]], address: str) -> l
             direction = "other"
             counterparty = recipient or sender or "unknown"
 
-        views.append(TxView(
-            hash=str(tx.get("hash") or ""),
-            timestamp=utc_timestamp(tx.get("timeStamp")),
-            direction=direction,
-            counterparty=counterparty,
-            value_eth=wei_to_eth(tx.get("value")),
-            fee_eth=transaction_fee_eth(tx) if sender == address else ZERO,
-            status=transaction_status(tx),
-            block_number=int(tx.get("blockNumber") or 0),
-        ))
+        method_id = str(tx.get("methodId") or "")
+        if not method_id:
+            input_data = str(tx.get("input") or "")
+            method_id = input_data[:10] if input_data.startswith("0x") and len(input_data) >= 10 else ""
+
+        views.append(
+            TxView(
+                hash=str(tx.get("hash") or ""),
+                timestamp=utc_timestamp(tx.get("timeStamp")),
+                direction=direction,
+                counterparty=counterparty,
+                value_native=wei_to_native(tx.get("value")),
+                fee_native=transaction_fee_native(tx) if sender == address else ZERO,
+                status=transaction_status(tx),
+                block_number=safe_int(tx.get("blockNumber")),
+                nonce=safe_int(tx.get("nonce")),
+                method_id=method_id,
+            )
+        )
     return views
 
 
@@ -466,31 +546,42 @@ def summarize(views: Iterable[TxView]) -> dict[str, Decimal | int]:
     sent = ZERO
     fees = ZERO
     failed = 0
+    successful = 0
 
     for tx in views:
+        fees += tx.fee_native
         if tx.status == "failed":
             failed += 1
-            # A failed transaction transfers no value, but the sender still pays gas.
-            fees += tx.fee_eth
             continue
+        successful += 1
         if tx.direction == "in":
-            received += tx.value_eth
+            received += tx.value_native
         elif tx.direction == "out":
-            sent += tx.value_eth
-        fees += tx.fee_eth
+            sent += tx.value_native
 
-    return {"received": received, "sent": sent, "fees": fees, "failed": failed}
+    return {
+        "received": received,
+        "sent": sent,
+        "fees": fees,
+        "failed": failed,
+        "successful": successful,
+        "net": received - sent - fees,
+    }
 
 
 def run_parallel(tasks: Mapping[str, Callable[[], T]], workers: int = 3) -> dict[str, Any]:
+    if not tasks:
+        return {}
     results: dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=min(workers, len(tasks)), thread_name_prefix="api") as pool:
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(tasks)), thread_name_prefix="etherscan-api"
+    ) as pool:
         futures = {pool.submit(func): name for name, func in tasks.items()}
         for future in as_completed(futures):
             name = futures[future]
             try:
                 results[name] = future.result()
-            except Exception as exc:  # preserve partial report when one endpoint fails
+            except Exception as exc:
                 LOG.error("%s request failed: %s", name, exc)
                 results[name] = None
     return results
@@ -500,49 +591,67 @@ def render_text(
     *,
     address: str,
     chain_id: int,
+    native_symbol: str,
     balance: Optional[Decimal],
     eth_price: Optional[Decimal],
     views: list[TxView],
     summary: Mapping[str, Decimal | int],
 ) -> None:
-    print("\nETHERSCAN WALLET REPORT")
-    print("=" * 72)
-    print(f"Address:          {address}")
-    print(f"Chain ID:         {chain_id}")
-    print(f"Native balance:   {format_eth(balance)}")
-    print(f"ETH/USD:          {format_usd(eth_price)}")
-    print(f"Sample received:  {format_eth(summary['received'])}")
-    print(f"Sample sent:      {format_eth(summary['sent'])}")
-    print(f"Sample fees:      {format_eth(summary['fees'])}")
-    print(f"Transactions:     {len(views)} ({summary['failed']} failed)")
-    print("\nNote: received/sent/fees cover only the displayed normal transactions.\n")
+    unit = native_symbol.upper()
+    print(f"\n{APP_NAME.upper()} REPORT")
+    print("=" * 76)
+    print(f"Address:             {address}")
+    print(f"Chain ID:            {chain_id}")
+    print(f"Native balance:      {format_native(balance, unit)}")
+    print(f"ETH/USD:             {format_usd(eth_price)}")
+    print(f"Sample received:     {format_native(summary['received'], unit)}")
+    print(f"Sample sent:         {format_native(summary['sent'], unit)}")
+    print(f"Sample fees:         {format_native(summary['fees'], unit)}")
+    print(f"Sample net movement: {format_native(summary['net'], unit)}")
+    print(
+        f"Transactions:        {len(views)} "
+        f"({summary['successful']} successful, {summary['failed']} failed)"
+    )
+    print("\nNote: sample totals cover only displayed normal transactions.\n")
 
     rows = [
         [
             tx.timestamp.replace("T", " ").replace("Z", ""),
             tx.direction,
             tx.status,
-            f"{tx.value_eth:.8f}",
-            f"{tx.fee_eth:.8f}" if tx.fee_eth else "-",
+            format(tx.value_native, ".8f"),
+            format(tx.fee_native, ".8f") if tx.fee_native else "-",
             short_address(tx.counterparty),
+            tx.method_id or "-",
             tx.hash[:14] + ("…" if len(tx.hash) > 14 else ""),
         ]
         for tx in views
     ]
     if rows:
-        print(tabulate(
-            rows,
-            headers=["UTC time", "Dir", "Status", "Value ETH", "Fee ETH", "Counterparty", "Hash"],
-            tablefmt="simple_grid",
-        ))
+        print(
+            tabulate(
+                rows,
+                headers=[
+                    "UTC time",
+                    "Dir",
+                    "Status",
+                    f"Value {unit}",
+                    f"Fee {unit}",
+                    "Counterparty",
+                    "Method",
+                    "Hash",
+                ],
+                tablefmt="simple_grid",
+            )
+        )
     else:
         print("No normal transactions found.")
 
 
-def format_eth(value: Any) -> str:
+def format_native(value: Any, symbol: str) -> str:
     if not isinstance(value, Decimal):
         return "N/A"
-    return f"{value:.8f}"
+    return f"{value:.8f} {symbol}"
 
 
 def format_usd(value: Optional[Decimal]) -> str:
@@ -556,99 +665,132 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("address", help="EVM address (0x + 40 hex characters)")
     parser.add_argument("--apikey", default=os.getenv("ETHERSCAN_API_KEY"), help="Etherscan API key")
-    parser.add_argument("--chain-id", type=positive_int, default=int(os.getenv("ETHERSCAN_CHAIN_ID", "1")))
-    parser.add_argument("--count", type=non_negative_int, default=10, help="number of recent normal transactions")
+    parser.add_argument(
+        "--base-url",
+        default=os.getenv("ETHERSCAN_BASE_URL", DEFAULT_BASE_URL),
+        help="Etherscan-compatible API V2 URL",
+    )
+    parser.add_argument(
+        "--chain-id",
+        type=positive_int,
+        default=env_int("ETHERSCAN_CHAIN_ID", 1),
+        help="EVM chain ID",
+    )
+    parser.add_argument("--native-symbol", default=os.getenv("NATIVE_SYMBOL", "ETH"))
+    parser.add_argument("--count", type=non_negative_int, default=10, help="recent normal transactions")
     parser.add_argument("--max-pages", type=positive_int, default=5)
-    parser.add_argument("--page-size", type=positive_int, default=100, help="maximum rows requested per API page")
+    parser.add_argument("--page-size", type=positive_int, default=100, help="rows per API page")
     parser.add_argument("--rate", type=positive_float, default=3.0, help="maximum API calls per second")
-    parser.add_argument("--timeout", type=positive_float, default=12.0, help="HTTP timeout in seconds")
+    parser.add_argument("--timeout", type=positive_float, default=12.0, help="read timeout in seconds")
     parser.add_argument("--retries", type=non_negative_int, default=4)
-    parser.add_argument("--cache-ttl", type=non_negative_int, default=300, help="transaction cache TTL in seconds")
+    parser.add_argument("--cache-ttl", type=non_negative_int, default=300, help="transaction cache TTL")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_eth"))
     parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--no-price", action="store_true", help="skip the ETH/USD request")
+    parser.add_argument("--no-price", action="store_true", help="skip ETH/USD request")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     return parser
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        parser = build_parser()
+    except ValidationError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
 
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    if not args.apikey:
+    if not args.apikey or not args.apikey.strip():
         parser.error("missing API key: use --apikey or ETHERSCAN_API_KEY")
 
     try:
         address = validate_address(args.address)
+        native_symbol = args.native_symbol.strip().upper()
+        if not native_symbol or len(native_symbol) > 12:
+            raise ValidationError("native symbol must contain 1 to 12 characters")
+
+        base_url = args.base_url.strip()
+        if not base_url.startswith(("https://", "http://")):
+            raise ValidationError("base URL must start with http:// or https://")
+
         settings = Settings(
-            base_url="https://api.etherscan.io/v2/api",
+            base_url=base_url,
             chain_id=args.chain_id,
             timeout=args.timeout,
             retries=args.retries,
             rate_limit=args.rate,
-            cache_dir=args.cache_dir,
+            cache_dir=args.cache_dir.expanduser(),
             cache_ttl=args.cache_ttl,
             max_pages=args.max_pages,
-            page_size=min(args.page_size, 1000),
+            page_size=min(args.page_size, 10000),
             no_cache=args.no_cache,
         )
-        client = EtherscanClient(args.apikey, settings)
+        client = EtherscanClient(args.apikey.strip(), settings)
 
         tasks: dict[str, Callable[[], Any]] = {
             "balance": lambda: client.balance(address),
             "transactions": lambda: client.transactions(address, args.count),
         }
-        if not args.no_price:
+        # Etherscan's ethprice endpoint is meaningful for Ethereum. On another chain,
+        # request it only when the user explicitly keeps the default behavior in mind.
+        if not args.no_price and settings.chain_id == 1:
             tasks["price"] = client.eth_price
+        elif not args.no_price:
+            LOG.info("Skipping ETH/USD price on chain ID %d; use --no-price to silence", settings.chain_id)
 
         result = run_parallel(tasks)
-        raw_transactions = result.get("transactions") or []
+        raw_transactions = result.get("transactions")
+        if raw_transactions is None:
+            raw_transactions = []
         views = normalize_transactions(raw_transactions, address)
         stats = summarize(views)
 
         if args.json:
             document = {
+                "schema_version": 1,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "address": address,
                 "chain_id": settings.chain_id,
-                "native_balance": (
-                    decimal_text(result["balance"])
-                    if isinstance(result.get("balance"), Decimal)
-                    else None
-                ),
-                "eth_usd": (
-                    decimal_text(result["price"])
-                    if isinstance(result.get("price"), Decimal)
-                    else None
-                ),
+                "native_symbol": native_symbol,
+                "native_balance": decimal_or_none(result.get("balance")),
+                "eth_usd": decimal_or_none(result.get("price")),
                 "sample": {
                     "transaction_count": len(views),
-                    "received_eth": decimal_text(stats["received"]),
-                    "sent_eth": decimal_text(stats["sent"]),
-                    "fees_eth": decimal_text(stats["fees"]),
+                    "successful_count": stats["successful"],
                     "failed_count": stats["failed"],
+                    "received_native": decimal_text(stats["received"]),
+                    "sent_native": decimal_text(stats["sent"]),
+                    "fees_native": decimal_text(stats["fees"]),
+                    "net_native": decimal_text(stats["net"]),
                 },
                 "transactions": [tx.to_json() for tx in views],
+                "errors": {
+                    key: "request failed"
+                    for key in ("balance", "transactions", "price")
+                    if key in tasks and result.get(key) is None
+                },
             }
             print(json.dumps(document, ensure_ascii=False, indent=2))
         else:
             render_text(
                 address=address,
                 chain_id=settings.chain_id,
+                native_symbol=native_symbol,
                 balance=result.get("balance"),
                 eth_price=result.get("price"),
                 views=views,
                 summary=stats,
             )
 
-        # Balance and transactions are the core report; price is optional.
-        return 0 if result.get("balance") is not None and result.get("transactions") is not None else 2
+        core_ok = result.get("balance") is not None and result.get("transactions") is not None
+        return 0 if core_ok else 2
 
     except (ValidationError, EtherscanError) as exc:
         LOG.error("%s", exc)
@@ -656,6 +798,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         LOG.warning("Interrupted")
         return 130
+
+
+def decimal_or_none(value: Any) -> Optional[str]:
+    return decimal_text(value) if isinstance(value, Decimal) else None
 
 
 if __name__ == "__main__":
