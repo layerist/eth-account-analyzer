@@ -9,7 +9,10 @@ Highlights:
 - parallel balance, price, and transaction requests
 - correct fixed-size pagination (no skipped rows)
 - precise Decimal-based value and fee calculations
-- partial-result reporting and machine-readable JSON
+- partial-result reporting with preserved error details
+- duplicate-safe pagination for moving page boundaries
+- fail-soft numeric parsing for malformed transaction rows
+- machine-readable JSON with partial/error metadata
 
 Requires:
     pip install requests tabulate
@@ -41,9 +44,9 @@ from tabulate import tabulate
 
 
 APP_NAME = "etherscan-wallet-analyzer"
-APP_VERSION = "3.0"
+APP_VERSION = "4.0"
 DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 LOG = logging.getLogger("etherscan_wallet")
 T = TypeVar("T")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -98,6 +101,16 @@ class TxView:
         result["value_native"] = decimal_text(self.value_native)
         result["fee_native"] = decimal_text(self.fee_native)
         return result
+
+
+@dataclass(frozen=True)
+class TaskResult:
+    value: Any = None
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
 
 class RateLimiter:
@@ -215,7 +228,7 @@ class EtherscanClient:
                     timeout=(min(5.0, self.settings.timeout), self.settings.timeout),
                 )
 
-                if response.status_code == 429 or 500 <= response.status_code <= 599:
+                if response.status_code in (408, 425, 429) or 500 <= response.status_code <= 599:
                     raise RetryableError(
                         f"HTTP {response.status_code}",
                         retry_after=parse_retry_after(response.headers.get("Retry-After")),
@@ -297,10 +310,11 @@ class EtherscanClient:
         }
         cached = self.cache.get(cache_key)
         if isinstance(cached, list) and all(isinstance(row, dict) for row in cached):
-            LOG.debug("Transaction cache hit")
-            return cached
+            LOG.debug("Transaction cache hit (%d rows)", len(cached))
+            return cached[:count]
 
         collected: list[dict[str, Any]] = []
+        seen: set[str] = set()
         offset = min(self.settings.page_size, 10000)
 
         for page in range(1, self.settings.max_pages + 1):
@@ -319,16 +333,36 @@ class EtherscanClient:
             if not isinstance(result, list):
                 raise EtherscanError("txlist returned a non-list result")
 
-            rows = [row for row in result if isinstance(row, dict)]
-            collected.extend(rows)
-            if len(collected) >= count or len(result) < offset:
+            valid_rows = 0
+            for row in result:
+                if not isinstance(row, dict):
+                    LOG.debug("Skipping non-object txlist row on page %d", page)
+                    continue
+                valid_rows += 1
+                tx_hash = str(row.get("hash") or "").lower()
+                # Page boundaries can theoretically shift while new blocks arrive.
+                # Hash-based deduplication makes the requested sample stable.
+                dedupe_key = tx_hash or json.dumps(row, sort_keys=True, default=str)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                collected.append(row)
+                if len(collected) >= count:
+                    break
+
+            if len(collected) >= count:
                 break
+            if len(result) < offset:
+                break
+            if valid_rows == 0:
+                raise EtherscanError(f"txlist page {page} contained no usable rows")
         else:
             if len(collected) < count:
                 LOG.warning(
-                    "Reached --max-pages=%d before collecting %d transactions",
+                    "Reached --max-pages=%d before collecting %d transactions (got %d)",
                     self.settings.max_pages,
                     count,
+                    len(collected),
                 )
 
         collected = collected[:count]
@@ -457,6 +491,14 @@ def parse_decimal(value: Any, *, field: str, required: bool = True) -> Optional[
     return number
 
 
+def safe_decimal(value: Any, default: Decimal = ZERO) -> Decimal:
+    try:
+        parsed = parse_decimal(value, field="numeric value", required=False)
+        return parsed if parsed is not None else default
+    except EtherscanError:
+        return default
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -465,7 +507,7 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 def wei_to_native(value: Any) -> Decimal:
-    return (parse_decimal(value, field="wei") or ZERO) / WEI
+    return safe_decimal(value) / WEI
 
 
 def decimal_text(value: Decimal) -> str:
@@ -495,13 +537,16 @@ def transaction_status(tx: Mapping[str, Any]) -> str:
 
 
 def transaction_fee_native(tx: Mapping[str, Any]) -> Decimal:
-    gas_used = parse_decimal(tx.get("gasUsed"), field="gasUsed") or ZERO
-    gas_price = parse_decimal(tx.get("gasPrice"), field="gasPrice") or ZERO
+    gas_used = safe_decimal(tx.get("gasUsed"))
+    # Etherscan txlist normally exposes the effective paid price in gasPrice.
+    # Prefer effectiveGasPrice if an Etherscan-compatible backend provides it.
+    gas_price = safe_decimal(tx.get("effectiveGasPrice") or tx.get("gasPrice"))
     return (gas_used * gas_price) / WEI
 
 
 def normalize_transactions(rows: Iterable[Mapping[str, Any]], address: str) -> list[TxView]:
     views: list[TxView] = []
+    address = address.lower()
     for tx in rows:
         sender = str(tx.get("from") or "").lower()
         recipient = str(tx.get("to") or "").lower()
@@ -511,7 +556,7 @@ def normalize_transactions(rows: Iterable[Mapping[str, Any]], address: str) -> l
             counterparty = address
         elif sender == address:
             direction = "out"
-            counterparty = recipient or "contract creation"
+            counterparty = recipient or str(tx.get("contractAddress") or "contract creation").lower()
         elif recipient == address:
             direction = "in"
             counterparty = sender or "unknown"
@@ -569,21 +614,21 @@ def summarize(views: Iterable[TxView]) -> dict[str, Decimal | int]:
     }
 
 
-def run_parallel(tasks: Mapping[str, Callable[[], T]], workers: int = 3) -> dict[str, Any]:
+def run_parallel(tasks: Mapping[str, Callable[[], T]], workers: int = 3) -> dict[str, TaskResult]:
     if not tasks:
         return {}
-    results: dict[str, Any] = {}
+    results: dict[str, TaskResult] = {}
     with ThreadPoolExecutor(
-        max_workers=min(workers, len(tasks)), thread_name_prefix="etherscan-api"
+        max_workers=min(max(1, workers), len(tasks)), thread_name_prefix="etherscan-api"
     ) as pool:
         futures = {pool.submit(func): name for name, func in tasks.items()}
         for future in as_completed(futures):
             name = futures[future]
             try:
-                results[name] = future.result()
+                results[name] = TaskResult(value=future.result())
             except Exception as exc:
                 LOG.error("%s request failed: %s", name, exc)
-                results[name] = None
+                results[name] = TaskResult(error=f"{type(exc).__name__}: {exc}")
     return results
 
 
@@ -683,6 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rate", type=positive_float, default=3.0, help="maximum API calls per second")
     parser.add_argument("--timeout", type=positive_float, default=12.0, help="read timeout in seconds")
     parser.add_argument("--retries", type=non_negative_int, default=4)
+    parser.add_argument("--workers", type=positive_int, default=3, help="parallel API worker threads")
     parser.add_argument("--cache-ttl", type=non_negative_int, default=300, help="transaction cache TTL")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_eth"))
     parser.add_argument("--no-cache", action="store_true")
@@ -745,10 +791,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif not args.no_price:
             LOG.info("Skipping ETH/USD price on chain ID %d; use --no-price to silence", settings.chain_id)
 
-        result = run_parallel(tasks)
-        raw_transactions = result.get("transactions")
-        if raw_transactions is None:
-            raw_transactions = []
+        result = run_parallel(tasks, workers=args.workers)
+        tx_result = result.get("transactions", TaskResult(error="missing result"))
+        raw_transactions = tx_result.value if tx_result.ok and isinstance(tx_result.value, list) else []
         views = normalize_transactions(raw_transactions, address)
         stats = summarize(views)
 
@@ -759,8 +804,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "address": address,
                 "chain_id": settings.chain_id,
                 "native_symbol": native_symbol,
-                "native_balance": decimal_or_none(result.get("balance")),
-                "eth_usd": decimal_or_none(result.get("price")),
+                "native_balance": decimal_or_none(result.get("balance", TaskResult()).value),
+                "eth_usd": decimal_or_none(result.get("price", TaskResult()).value),
                 "sample": {
                     "transaction_count": len(views),
                     "successful_count": stats["successful"],
@@ -772,10 +817,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 },
                 "transactions": [tx.to_json() for tx in views],
                 "errors": {
-                    key: "request failed"
-                    for key in ("balance", "transactions", "price")
-                    if key in tasks and result.get(key) is None
+                    key: item.error
+                    for key, item in result.items()
+                    if item.error is not None
                 },
+                "partial": any(item.error is not None for item in result.values()),
             }
             print(json.dumps(document, ensure_ascii=False, indent=2))
         else:
@@ -783,13 +829,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 address=address,
                 chain_id=settings.chain_id,
                 native_symbol=native_symbol,
-                balance=result.get("balance"),
-                eth_price=result.get("price"),
+                balance=result.get("balance", TaskResult()).value,
+                eth_price=result.get("price", TaskResult()).value,
                 views=views,
                 summary=stats,
             )
 
-        core_ok = result.get("balance") is not None and result.get("transactions") is not None
+        core_ok = (
+            result.get("balance", TaskResult(error="missing")).ok
+            and result.get("transactions", TaskResult(error="missing")).ok
+        )
         return 0 if core_ok else 2
 
     except (ValidationError, EtherscanError) as exc:
