@@ -5,14 +5,16 @@ Highlights:
 - Etherscan API V2 with configurable chain ID and base URL
 - thread-safe global request pacing
 - bounded exponential backoff with Retry-After support
-- atomic TTL cache with schema versioning
+- durable atomic TTL cache with schema envelopes and fsync
 - parallel balance, price, and transaction requests
 - correct fixed-size pagination (no skipped rows)
 - precise Decimal-based value and fee calculations
 - partial-result reporting with preserved error details
-- duplicate-safe pagination for moving page boundaries
+- snapshot-stabilized, duplicate-safe pagination for moving page boundaries
 - fail-soft numeric parsing for malformed transaction rows
-- machine-readable JSON with partial/error metadata
+- machine-readable JSON with partial/error metadata and request metrics
+- interruptible retry sleeps and deterministic HTTP session cleanup
+- transport-failure session recycling to avoid poisoned pooled connections
 
 Requires:
     pip install requests tabulate
@@ -44,9 +46,9 @@ from tabulate import tabulate
 
 
 APP_NAME = "etherscan-wallet-analyzer"
-APP_VERSION = "4.0"
+APP_VERSION = "5.0"
 DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 LOG = logging.getLogger("etherscan_wallet")
 T = TypeVar("T")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -74,6 +76,7 @@ class Settings:
     base_url: str
     chain_id: int
     timeout: float
+    connect_timeout: float
     retries: int
     rate_limit: float
     cache_dir: Path
@@ -114,7 +117,11 @@ class TaskResult:
 
 
 class RateLimiter:
-    """Thread-safe fixed-interval limiter based on monotonic time."""
+    """Thread-safe fixed-interval limiter using slot reservation.
+
+    The lock protects only scheduling; sleeping happens outside the lock so a slow
+    thread does not block every other caller from reserving its next slot.
+    """
 
     def __init__(self, calls_per_second: float) -> None:
         if calls_per_second <= 0:
@@ -123,17 +130,23 @@ class RateLimiter:
         self._next_allowed = 0.0
         self._lock = threading.Lock()
 
-    def wait(self) -> None:
+    def wait(self, stop_event: Optional[threading.Event] = None) -> None:
         with self._lock:
             now = time.monotonic()
-            delay = self._next_allowed - now
-            if delay > 0:
-                time.sleep(delay)
-                now = time.monotonic()
-            self._next_allowed = max(now, self._next_allowed) + self._interval
+            slot = max(now, self._next_allowed)
+            self._next_allowed = slot + self._interval
+        delay = slot - now
+        if delay <= 0:
+            return
+        if stop_event is None:
+            time.sleep(delay)
+        elif stop_event.wait(delay):
+            raise KeyboardInterrupt
 
 
 class AtomicJsonCache:
+    """Small durable JSON cache. Corrupt entries are discarded safely."""
+
     def __init__(self, directory: Path, ttl: int, disabled: bool = False) -> None:
         self.directory = directory
         self.ttl = ttl
@@ -149,18 +162,30 @@ class AtomicJsonCache:
             return None
         path = self._path(key)
         try:
-            stat = path.stat()
             if not path.is_file():
                 return None
-            age = max(0.0, time.time() - stat.st_mtime)
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(envelope, dict):
+                raise ValueError("cache envelope is not an object")
+            if envelope.get("schema") != CACHE_SCHEMA_VERSION:
+                path.unlink(missing_ok=True)
+                return None
+            created_at = float(envelope.get("created_at", -1))
+            if created_at < 0 or not (created_at < float("inf")):
+                raise ValueError("invalid cache timestamp")
+            age = max(0.0, time.time() - created_at)
             if age > self.ttl:
                 path.unlink(missing_ok=True)
                 return None
-            return json.loads(path.read_text(encoding="utf-8"))
+            return envelope.get("value")
         except FileNotFoundError:
             return None
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, OverflowError) as exc:
             LOG.debug("Ignoring unreadable cache file %s: %s", path, exc)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return None
 
     def put(self, key: Mapping[str, Any], value: Any) -> None:
@@ -168,13 +193,20 @@ class AtomicJsonCache:
             return
         path = self._path(key)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        envelope = {
+            "schema": CACHE_SCHEMA_VERSION,
+            "created_at": time.time(),
+            "value": value,
+        }
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(
-                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            data = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
+            fsync_directory(self.directory)
         except OSError as exc:
             LOG.debug("Cache write failed for %s: %s", path, exc)
             try:
@@ -184,12 +216,18 @@ class AtomicJsonCache:
 
 
 class EtherscanClient:
-    def __init__(self, api_key: str, settings: Settings) -> None:
+    def __init__(self, api_key: str, settings: Settings, stop_event: Optional[threading.Event] = None) -> None:
         self.api_key = api_key
         self.settings = settings
+        self.stop_event = stop_event or threading.Event()
         self.limiter = RateLimiter(settings.rate_limit)
         self.cache = AtomicJsonCache(settings.cache_dir, settings.cache_ttl, settings.no_cache)
         self._local = threading.local()
+        self._sessions: set[requests.Session] = set()
+        self._sessions_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._requests = 0
+        self._retries = 0
 
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -197,17 +235,34 @@ class EtherscanClient:
             return session
 
         session = requests.Session()
-        adapter = HTTPAdapter(max_retries=0, pool_connections=4, pool_maxsize=4)
+        adapter = HTTPAdapter(max_retries=0, pool_connections=4, pool_maxsize=4, pool_block=True)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        session.headers.update(
-            {
-                "Accept": "application/json",
-                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-            }
-        )
+        session.headers.update({"Accept": "application/json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
         self._local.session = session
+        with self._sessions_lock:
+            self._sessions.add(session)
         return session
+
+    def close(self) -> None:
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                LOG.debug("Session close failed", exc_info=True)
+
+    def metrics(self) -> dict[str, int]:
+        with self._metrics_lock:
+            return {"http_attempts": self._requests, "retries": self._retries}
+
+    def _note_attempt(self, retry: bool) -> None:
+        with self._metrics_lock:
+            self._requests += 1
+            if retry:
+                self._retries += 1
 
     def request(self, *, module: str, action: str, **params: Any) -> Any:
         query = {
@@ -220,12 +275,15 @@ class EtherscanClient:
         last_error: Optional[BaseException] = None
 
         for attempt in range(self.settings.retries + 1):
-            self.limiter.wait()
+            if self.stop_event.is_set():
+                raise KeyboardInterrupt
+            self.limiter.wait(self.stop_event)
+            self._note_attempt(retry=attempt > 0)
             try:
                 response = self._session().get(
                     self.settings.base_url,
                     params=query,
-                    timeout=(min(5.0, self.settings.timeout), self.settings.timeout),
+                    timeout=(self.settings.connect_timeout, self.settings.timeout),
                 )
 
                 if response.status_code in (408, 425, 429) or 500 <= response.status_code <= 599:
@@ -258,6 +316,8 @@ class EtherscanClient:
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = exc
                 delay = backoff(attempt)
+                # A connection that just failed is cheap to replace and may contain bad pooled state.
+                self._discard_thread_session()
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else "unknown"
                 preview = response_preview(exc.response)
@@ -267,34 +327,34 @@ class EtherscanClient:
                 break
             LOG.warning(
                 "%s/%s failed (%s); retrying in %.2fs [%d/%d]",
-                module,
-                action,
-                last_error,
-                delay,
-                attempt + 1,
-                self.settings.retries,
+                module, action, last_error, delay, attempt + 1, self.settings.retries,
             )
-            time.sleep(delay)
+            interruptible_sleep(delay, self.stop_event)
 
         raise EtherscanError(
-            f"Etherscan {module}/{action} failed after {self.settings.retries + 1} attempts: "
-            f"{last_error}"
+            f"Etherscan {module}/{action} failed after {self.settings.retries + 1} attempts: {last_error}"
         )
+
+    def _discard_thread_session(self) -> None:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            return
+        self._local.session = None
+        with self._sessions_lock:
+            self._sessions.discard(session)
+        try:
+            session.close()
+        except Exception:
+            pass
 
     def balance(self, address: str) -> Decimal:
-        return wei_to_native(
-            self.request(module="account", action="balance", address=address, tag="latest")
-        )
+        return wei_to_native(self.request(module="account", action="balance", address=address, tag="latest"))
 
     def eth_price(self) -> Optional[Decimal]:
-        try:
-            result = self.request(module="stats", action="ethprice")
-            if not isinstance(result, dict):
-                return None
-            return parse_decimal(result.get("ethusd"), field="ethusd", required=False)
-        except EtherscanError as exc:
-            LOG.warning("ETH/USD price unavailable: %s", exc)
-            return None
+        result = self.request(module="stats", action="ethprice")
+        if not isinstance(result, dict):
+            raise EtherscanError("ethprice returned a non-object result")
+        return parse_decimal(result.get("ethusd"), field="ethusd", required=True)
 
     def transactions(self, address: str, count: int) -> list[dict[str, Any]]:
         if count == 0:
@@ -315,7 +375,9 @@ class EtherscanClient:
 
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
-        offset = min(self.settings.page_size, 10000)
+        # Keep offset fixed across pages. Changing it between pages would skip rows.
+        offset = min(self.settings.page_size, max(1, count), 10000)
+        snapshot_endblock = 99999999
 
         for page in range(1, self.settings.max_pages + 1):
             result = self.request(
@@ -323,7 +385,7 @@ class EtherscanClient:
                 action="txlist",
                 address=address,
                 startblock=0,
-                endblock=99999999,
+                endblock=snapshot_endblock,
                 page=page,
                 offset=offset,
                 sort="desc",
@@ -334,14 +396,16 @@ class EtherscanClient:
                 raise EtherscanError("txlist returned a non-list result")
 
             valid_rows = 0
+            page_blocks: list[int] = []
             for row in result:
                 if not isinstance(row, dict):
                     LOG.debug("Skipping non-object txlist row on page %d", page)
                     continue
                 valid_rows += 1
+                block = safe_int(row.get("blockNumber"), -1)
+                if block >= 0:
+                    page_blocks.append(block)
                 tx_hash = str(row.get("hash") or "").lower()
-                # Page boundaries can theoretically shift while new blocks arrive.
-                # Hash-based deduplication makes the requested sample stable.
                 dedupe_key = tx_hash or json.dumps(row, sort_keys=True, default=str)
                 if dedupe_key in seen:
                     continue
@@ -349,6 +413,11 @@ class EtherscanClient:
                 collected.append(row)
                 if len(collected) >= count:
                     break
+
+            # Freeze subsequent page boundaries to the newest block observed on page 1.
+            # This prevents newly mined later blocks from pushing rows onto another page.
+            if page == 1 and page_blocks:
+                snapshot_endblock = max(page_blocks)
 
             if len(collected) >= count:
                 break
@@ -360,9 +429,7 @@ class EtherscanClient:
             if len(collected) < count:
                 LOG.warning(
                     "Reached --max-pages=%d before collecting %d transactions (got %d)",
-                    self.settings.max_pages,
-                    count,
-                    len(collected),
+                    self.settings.max_pages, count, len(collected),
                 )
 
         collected = collected[:count]
@@ -384,6 +451,29 @@ def response_preview(response: Optional[requests.Response], limit: int = 240) ->
     if response is None:
         return "no response body"
     return response.text[:limit].replace("\r", " ").replace("\n", " ").strip() or "empty body"
+
+
+def fsync_directory(directory: Path) -> None:
+    """Best-effort directory fsync so os.replace() is durable on POSIX."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def interruptible_sleep(delay: float, stop_event: threading.Event) -> None:
+    if delay <= 0:
+        return
+    if stop_event.wait(min(delay, MAX_RETRY_DELAY)):
+        raise KeyboardInterrupt
 
 
 def backoff(attempt: int) -> float:
@@ -614,21 +704,38 @@ def summarize(views: Iterable[TxView]) -> dict[str, Decimal | int]:
     }
 
 
-def run_parallel(tasks: Mapping[str, Callable[[], T]], workers: int = 3) -> dict[str, TaskResult]:
+def run_parallel(
+    tasks: Mapping[str, Callable[[], T]],
+    workers: int = 3,
+    stop_event: Optional[threading.Event] = None,
+) -> dict[str, TaskResult]:
     if not tasks:
         return {}
+    stop_event = stop_event or threading.Event()
     results: dict[str, TaskResult] = {}
-    with ThreadPoolExecutor(
+    pool = ThreadPoolExecutor(
         max_workers=min(max(1, workers), len(tasks)), thread_name_prefix="etherscan-api"
-    ) as pool:
-        futures = {pool.submit(func): name for name, func in tasks.items()}
+    )
+    futures = {pool.submit(func): name for name, func in tasks.items()}
+    try:
         for future in as_completed(futures):
             name = futures[future]
             try:
                 results[name] = TaskResult(value=future.result())
+            except KeyboardInterrupt:
+                stop_event.set()
+                raise
             except Exception as exc:
                 LOG.error("%s request failed: %s", name, exc)
                 results[name] = TaskResult(error=f"{type(exc).__name__}: {exc}")
+    except KeyboardInterrupt:
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
     return results
 
 
@@ -727,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-size", type=positive_int, default=100, help="rows per API page")
     parser.add_argument("--rate", type=positive_float, default=3.0, help="maximum API calls per second")
     parser.add_argument("--timeout", type=positive_float, default=12.0, help="read timeout in seconds")
+    parser.add_argument("--connect-timeout", type=positive_float, default=5.0, help="connect timeout in seconds")
     parser.add_argument("--retries", type=non_negative_int, default=4)
     parser.add_argument("--workers", type=positive_int, default=3, help="parallel API worker threads")
     parser.add_argument("--cache-ttl", type=non_negative_int, default=300, help="transaction cache TTL")
@@ -765,11 +873,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         base_url = args.base_url.strip()
         if not base_url.startswith(("https://", "http://")):
             raise ValidationError("base URL must start with http:// or https://")
+        if args.chain_id <= 0:
+            raise ValidationError("chain ID must be greater than zero")
+        if args.page_size > 10000:
+            LOG.warning("Clamping --page-size from %d to 10000", args.page_size)
 
         settings = Settings(
             base_url=base_url,
             chain_id=args.chain_id,
             timeout=args.timeout,
+            connect_timeout=args.connect_timeout,
             retries=args.retries,
             rate_limit=args.rate,
             cache_dir=args.cache_dir.expanduser(),
@@ -778,7 +891,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             page_size=min(args.page_size, 10000),
             no_cache=args.no_cache,
         )
-        client = EtherscanClient(args.apikey.strip(), settings)
+        stop_event = threading.Event()
+        client = EtherscanClient(args.apikey.strip(), settings, stop_event=stop_event)
 
         tasks: dict[str, Callable[[], Any]] = {
             "balance": lambda: client.balance(address),
@@ -791,7 +905,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif not args.no_price:
             LOG.info("Skipping ETH/USD price on chain ID %d; use --no-price to silence", settings.chain_id)
 
-        result = run_parallel(tasks, workers=args.workers)
+        try:
+            result = run_parallel(tasks, workers=args.workers, stop_event=stop_event)
+        finally:
+            client.close()
         tx_result = result.get("transactions", TaskResult(error="missing result"))
         raw_transactions = tx_result.value if tx_result.ok and isinstance(tx_result.value, list) else []
         views = normalize_transactions(raw_transactions, address)
@@ -816,6 +933,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "net_native": decimal_text(stats["net"]),
                 },
                 "transactions": [tx.to_json() for tx in views],
+                "metrics": client.metrics(),
                 "errors": {
                     key: item.error
                     for key, item in result.items()
