@@ -33,12 +33,14 @@ import re
 import sys
 import threading
 import time
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, TypeVar
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,9 +48,9 @@ from tabulate import tabulate
 
 
 APP_NAME = "etherscan-wallet-analyzer"
-APP_VERSION = "5.0"
+APP_VERSION = "6.0"
 DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 LOG = logging.getLogger("etherscan_wallet")
 T = TypeVar("T")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -228,6 +230,8 @@ class EtherscanClient:
         self._metrics_lock = threading.Lock()
         self._requests = 0
         self._retries = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -256,7 +260,19 @@ class EtherscanClient:
 
     def metrics(self) -> dict[str, int]:
         with self._metrics_lock:
-            return {"http_attempts": self._requests, "retries": self._retries}
+            return {
+                "http_attempts": self._requests,
+                "retries": self._retries,
+                "cache_hits": self._cache_hits,
+                "cache_misses": self._cache_misses,
+            }
+
+    def _note_cache(self, hit: bool) -> None:
+        with self._metrics_lock:
+            if hit:
+                self._cache_hits += 1
+            else:
+                self._cache_misses += 1
 
     def _note_attempt(self, retry: bool) -> None:
         with self._metrics_lock:
@@ -370,8 +386,10 @@ class EtherscanClient:
         }
         cached = self.cache.get(cache_key)
         if isinstance(cached, list) and all(isinstance(row, dict) for row in cached):
+            self._note_cache(True)
             LOG.debug("Transaction cache hit (%d rows)", len(cached))
             return cached[:count]
+        self._note_cache(False)
 
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -558,9 +576,24 @@ def positive_float(value: str) -> float:
         number = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a number") from exc
-    if number <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
     return number
+
+
+def validate_base_url(value: str) -> str:
+    url = value.strip()
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ValidationError(f"invalid base URL: {exc}") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValidationError("base URL must be an absolute http:// or https:// URL")
+    if parsed.username or parsed.password:
+        raise ValidationError("base URL must not contain embedded credentials")
+    if parsed.fragment:
+        raise ValidationError("base URL must not contain a fragment")
+    return url
 
 
 def parse_decimal(value: Any, *, field: str, required: bool = True) -> Optional[Decimal]:
@@ -748,6 +781,8 @@ def render_text(
     eth_price: Optional[Decimal],
     views: list[TxView],
     summary: Mapping[str, Decimal | int],
+    errors: Mapping[str, str],
+    metrics: Mapping[str, int],
 ) -> None:
     unit = native_symbol.upper()
     print(f"\n{APP_NAME.upper()} REPORT")
@@ -764,7 +799,16 @@ def render_text(
         f"Transactions:        {len(views)} "
         f"({summary['successful']} successful, {summary['failed']} failed)"
     )
-    print("\nNote: sample totals cover only displayed normal transactions.\n")
+    print("\nNote: sample totals cover only displayed normal transactions.")
+    if errors:
+        print("WARNING: partial result; one or more API tasks failed:", file=sys.stderr)
+        for name, error in sorted(errors.items()):
+            print(f"  - {name}: {error}", file=sys.stderr)
+    print(
+        f"HTTP attempts: {metrics.get('http_attempts', 0)}; "
+        f"retries: {metrics.get('retries', 0)}; "
+        f"tx-cache hits/misses: {metrics.get('cache_hits', 0)}/{metrics.get('cache_misses', 0)}\n"
+    )
 
     rows = [
         [
@@ -870,9 +914,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not native_symbol or len(native_symbol) > 12:
             raise ValidationError("native symbol must contain 1 to 12 characters")
 
-        base_url = args.base_url.strip()
-        if not base_url.startswith(("https://", "http://")):
-            raise ValidationError("base URL must start with http:// or https://")
+        base_url = validate_base_url(args.base_url)
         if args.chain_id <= 0:
             raise ValidationError("chain ID must be greater than zero")
         if args.page_size > 10000:
@@ -914,6 +956,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         views = normalize_transactions(raw_transactions, address)
         stats = summarize(views)
 
+        errors = {key: item.error for key, item in result.items() if item.error is not None}
+        metrics = client.metrics()
+
         if args.json:
             document = {
                 "schema_version": 1,
@@ -933,13 +978,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "net_native": decimal_text(stats["net"]),
                 },
                 "transactions": [tx.to_json() for tx in views],
-                "metrics": client.metrics(),
-                "errors": {
-                    key: item.error
-                    for key, item in result.items()
-                    if item.error is not None
-                },
-                "partial": any(item.error is not None for item in result.values()),
+                "metrics": metrics,
+                "errors": errors,
+                "partial": bool(errors),
             }
             print(json.dumps(document, ensure_ascii=False, indent=2))
         else:
@@ -951,6 +992,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 eth_price=result.get("price", TaskResult()).value,
                 views=views,
                 summary=stats,
+                errors=errors,
+                metrics=metrics,
             )
 
         core_ok = (
