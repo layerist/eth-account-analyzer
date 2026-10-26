@@ -27,13 +27,13 @@ import email.utils
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
 import sys
 import threading
 import time
-import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -48,9 +48,9 @@ from tabulate import tabulate
 
 
 APP_NAME = "etherscan-wallet-analyzer"
-APP_VERSION = "6.0"
+APP_VERSION = "6.1"
 DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
 LOG = logging.getLogger("etherscan_wallet")
 T = TypeVar("T")
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -126,9 +126,11 @@ class RateLimiter:
     """
 
     def __init__(self, calls_per_second: float) -> None:
-        if calls_per_second <= 0:
-            raise ValidationError("rate limit must be greater than zero")
+        if not math.isfinite(calls_per_second) or calls_per_second <= 0:
+            raise ValidationError("rate limit must be finite and greater than zero")
         self._interval = 1.0 / calls_per_second
+        if not math.isfinite(self._interval):
+            raise ValidationError("rate limit is too small")
         self._next_allowed = 0.0
         self._lock = threading.Lock()
 
@@ -137,13 +139,19 @@ class RateLimiter:
             now = time.monotonic()
             slot = max(now, self._next_allowed)
             self._next_allowed = slot + self._interval
-        delay = slot - now
-        if delay <= 0:
-            return
-        if stop_event is None:
-            time.sleep(delay)
-        elif stop_event.wait(delay):
-            raise KeyboardInterrupt
+        # Sleep in bounded chunks so even extreme rates remain interruptible and
+        # do not overflow the platform's sleep/condition timeout representation.
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise KeyboardInterrupt
+            remaining = slot - time.monotonic()
+            if remaining <= 0:
+                return
+            delay = min(remaining, MAX_RETRY_DELAY)
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                raise KeyboardInterrupt
 
 
 class AtomicJsonCache:
@@ -175,8 +183,9 @@ class AtomicJsonCache:
             created_at = float(envelope.get("created_at", -1))
             if created_at < 0 or not (created_at < float("inf")):
                 raise ValueError("invalid cache timestamp")
-            age = max(0.0, time.time() - created_at)
-            if age > self.ttl:
+            age = time.time() - created_at
+            # Reject future-dated entries: a clock correction must not make them immortal.
+            if age < -60.0 or age > self.ttl:
                 path.unlink(missing_ok=True)
                 return None
             return envelope.get("value")
@@ -209,7 +218,7 @@ class AtomicJsonCache:
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
             fsync_directory(self.directory)
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             LOG.debug("Cache write failed for %s: %s", path, exc)
             try:
                 tmp.unlink(missing_ok=True)
@@ -232,6 +241,7 @@ class EtherscanClient:
         self._retries = 0
         self._cache_hits = 0
         self._cache_misses = 0
+        self.transactions_truncated = False
 
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -295,6 +305,7 @@ class EtherscanClient:
                 raise KeyboardInterrupt
             self.limiter.wait(self.stop_event)
             self._note_attempt(retry=attempt > 0)
+            response: Optional[requests.Response] = None
             try:
                 response = self._session().get(
                     self.settings.base_url,
@@ -315,7 +326,7 @@ class EtherscanClient:
                 result = payload.get("result")
                 combined = f"{message} {result}".lower()
 
-                if is_no_records(message, result):
+                if module == "account" and action == "txlist" and is_no_records(message, result):
                     return []
                 if is_retryable_api_error(combined):
                     raise RetryableError(str(result or message or "temporary API error"))
@@ -338,6 +349,9 @@ class EtherscanClient:
                 status = exc.response.status_code if exc.response is not None else "unknown"
                 preview = response_preview(exc.response)
                 raise EtherscanError(f"HTTP {status} for {module}/{action}: {preview}") from exc
+            finally:
+                if response is not None:
+                    response.close()
 
             if attempt >= self.settings.retries:
                 break
@@ -364,7 +378,12 @@ class EtherscanClient:
             pass
 
     def balance(self, address: str) -> Decimal:
-        return wei_to_native(self.request(module="account", action="balance", address=address, tag="latest"))
+        # A malformed balance response must never silently become a zero balance.
+        result = self.request(module="account", action="balance", address=address, tag="latest")
+        amount = parse_decimal(result, field="balance", required=True)
+        if amount < 0:
+            raise EtherscanError(f"Invalid negative balance: {result!r}")
+        return amount / WEI
 
     def eth_price(self) -> Optional[Decimal]:
         result = self.request(module="stats", action="ethprice")
@@ -373,13 +392,15 @@ class EtherscanClient:
         return parse_decimal(result.get("ethusd"), field="ethusd", required=True)
 
     def transactions(self, address: str, count: int) -> list[dict[str, Any]]:
+        self.transactions_truncated = False
         if count == 0:
             return []
 
         cache_key = {
             "schema": CACHE_SCHEMA_VERSION,
             "chain_id": self.settings.chain_id,
-            "address": address,
+            "base_url": self.settings.base_url,
+            "address": address.lower(),
             "count": count,
             "max_pages": self.settings.max_pages,
             "page_size": self.settings.page_size,
@@ -395,7 +416,8 @@ class EtherscanClient:
         seen: set[str] = set()
         # Keep offset fixed across pages. Changing it between pages would skip rows.
         offset = min(self.settings.page_size, max(1, count), 10000)
-        snapshot_endblock = 99999999
+        # Etherscan's documented high endblock sentinel also accommodates fast chains.
+        snapshot_endblock = 9999999999
 
         for page in range(1, self.settings.max_pages + 1):
             result = self.request(
@@ -408,10 +430,10 @@ class EtherscanClient:
                 offset=offset,
                 sort="desc",
             )
-            if not result:
-                break
             if not isinstance(result, list):
                 raise EtherscanError("txlist returned a non-list result")
+            if not result:
+                break
 
             valid_rows = 0
             page_blocks: list[int] = []
@@ -439,19 +461,22 @@ class EtherscanClient:
 
             if len(collected) >= count:
                 break
-            if len(result) < offset:
-                break
             if valid_rows == 0:
                 raise EtherscanError(f"txlist page {page} contained no usable rows")
+            if len(result) < offset:
+                break
         else:
             if len(collected) < count:
+                self.transactions_truncated = True
                 LOG.warning(
                     "Reached --max-pages=%d before collecting %d transactions (got %d)",
                     self.settings.max_pages, count, len(collected),
                 )
 
         collected = collected[:count]
-        self.cache.put(cache_key, collected)
+        # Incomplete page-limited samples must not be mistaken for complete cache hits.
+        if not self.transactions_truncated:
+            self.cache.put(cache_key, collected)
         return collected
 
 
@@ -495,15 +520,18 @@ def interruptible_sleep(delay: float, stop_event: threading.Event) -> None:
 
 
 def backoff(attempt: int) -> float:
-    return min(20.0, 0.8 * (2**attempt)) + random.uniform(0.0, 0.35)
+    # Saturate before exponentiation to avoid enormous integers for high retry counts.
+    return min(20.0, 0.8 * (2 ** min(attempt, 5))) + random.uniform(0.0, 0.35)
 
 
 def parse_retry_after(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
     try:
-        return min(max(float(value), 0.0), MAX_RETRY_DELAY)
-    except ValueError:
+        seconds = float(value)
+        if math.isfinite(seconds):
+            return min(max(seconds, 0.0), MAX_RETRY_DELAY)
+    except (TypeError, ValueError, OverflowError):
         pass
 
     try:
@@ -511,6 +539,8 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=timezone.utc)
         seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        if not math.isfinite(seconds):
+            return None
         return min(max(seconds, 0.0), MAX_RETRY_DELAY)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -625,7 +655,7 @@ def safe_decimal(value: Any, default: Decimal = ZERO) -> Decimal:
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -765,7 +795,8 @@ def run_parallel(
         stop_event.set()
         for future in futures:
             future.cancel()
-        pool.shutdown(wait=False, cancel_futures=True)
+        # Wait for in-flight tasks to stop before their HTTP sessions are closed.
+        pool.shutdown(wait=True, cancel_futures=True)
         raise
     else:
         pool.shutdown(wait=True)
@@ -783,6 +814,7 @@ def render_text(
     summary: Mapping[str, Decimal | int],
     errors: Mapping[str, str],
     metrics: Mapping[str, int],
+    truncated: bool = False,
 ) -> None:
     unit = native_symbol.upper()
     print(f"\n{APP_NAME.upper()} REPORT")
@@ -800,6 +832,8 @@ def render_text(
         f"({summary['successful']} successful, {summary['failed']} failed)"
     )
     print("\nNote: sample totals cover only displayed normal transactions.")
+    if truncated:
+        print("WARNING: transaction sample is incomplete (maximum page limit reached).", file=sys.stderr)
     if errors:
         print("WARNING: partial result; one or more API tasks failed:", file=sys.stderr)
         for name, error in sorted(errors.items()):
@@ -972,6 +1006,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "transaction_count": len(views),
                     "successful_count": stats["successful"],
                     "failed_count": stats["failed"],
+                    "truncated": client.transactions_truncated,
                     "received_native": decimal_text(stats["received"]),
                     "sent_native": decimal_text(stats["sent"]),
                     "fees_native": decimal_text(stats["fees"]),
@@ -980,7 +1015,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "transactions": [tx.to_json() for tx in views],
                 "metrics": metrics,
                 "errors": errors,
-                "partial": bool(errors),
+                "partial": bool(errors) or client.transactions_truncated,
             }
             print(json.dumps(document, ensure_ascii=False, indent=2))
         else:
@@ -994,6 +1029,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 summary=stats,
                 errors=errors,
                 metrics=metrics,
+                truncated=client.transactions_truncated,
             )
 
         core_ok = (
